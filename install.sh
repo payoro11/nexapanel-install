@@ -24,12 +24,50 @@ DB_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)
 PANEL_DB_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 20)
 PMA_DIR="/var/www/phpmyadmin"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}✓${NC} $1" | tee -a "$LOG"; }
-info() { echo -e "${BLUE}➜${NC} $1" | tee -a "$LOG"; }
-warn() { echo -e "${YELLOW}⚠${NC} $1" | tee -a "$LOG"; }
-fail() { echo -e "${RED}✗ ERROR:${NC} $1" | tee -a "$LOG"; exit 1; }
-step() { echo -e "\n${BOLD}${BLUE}══ $1 ${NC}" | tee -a "$LOG"; }
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+STEP=0
+STEPS_TOTAL=15   # updated below after pre-flight
+
+# Print helpers — all tee to log
+ok()   { echo -e "  ${GREEN}✓${NC} $1" | tee -a "$LOG"; }
+sub()  { echo -e "  ${CYAN}→${NC} $1" | tee -a "$LOG"; }
+info() { echo -e "  ${BLUE}»${NC} $1" | tee -a "$LOG"; }
+warn() { echo -e "  ${YELLOW}⚠  WARNING:${NC} $1" | tee -a "$LOG"; }
+fail() { echo -e "\n  ${RED}✗  FATAL:${NC} $1" | tee -a "$LOG"; echo "" | tee -a "$LOG"
+         echo "  Log: $LOG" | tee -a "$LOG"; exit 1; }
+
+step() {
+  STEP=$((STEP+1))
+  echo "" | tee -a "$LOG"
+  printf "\033[1;34m┌──────────────────────────────────────────────────────────────┐\033[0m\n" | tee -a "$LOG"
+  printf "\033[1;34m│\033[0m  \033[1m[%02d/%02d]\033[0m  %s\n" "$STEP" "$STEPS_TOTAL" "$1" | tee -a "$LOG"
+  printf "\033[1;34m└──────────────────────────────────────────────────────────────┘\033[0m\n" | tee -a "$LOG"
+}
+
+# Run a command — show output on screen AND save to log
+rcmd() {
+  echo -e "  ${DIM}»${NC} $*" | tee -a "$LOG"
+  eval "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+# pkg_install: install packages with VISIBLE output (user sees progress)
+pkg_show() {
+  echo -e "  ${CYAN}→${NC} Installing: $*" | tee -a "$LOG"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+pkg_show_yum() {
+  echo -e "  ${CYAN}→${NC} Installing: $*" | tee -a "$LOG"
+  "$PKG_MGR" install -y "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+# Check helpers
+is_cmd()     { command -v "$1" > /dev/null 2>&1; }
+svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 
 # ── Root check ─────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then fail "Run as root: sudo bash install.sh"; fi
@@ -50,7 +88,7 @@ cat << 'NEXABANNER'
 NEXABANNER
 printf '\033[0m'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.8\033[0m\n'
+printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.9\033[0m\n'
 printf '\033[38;5;208m  A Brand of \033[1;37mNexaroot Technology India Pvt Ltd\033[0m  \033[38;5;208m•  Powered By \033[1;37mHOSTGANGA.COM\033[0m\n'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\n'
@@ -107,12 +145,77 @@ esac
 
 ok "OS family: $OS_FAMILY | Package manager: $PKG_MGR | Firewall: $FIREWALL_TYPE"
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PRE-FLIGHT CHECKS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+echo ""
+printf "\033[1;33m┌──────────────────────────────────────────────────────────────┐\033[0m\n"
+printf "\033[1;33m│  Pre-flight System Checks                                    │\033[0m\n"
+printf "\033[1;33m└──────────────────────────────────────────────────────────────┘\033[0m\n"
+
+# RAM check (minimum 512MB)
+RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+RAM_GB=$(echo "$RAM_MB" | awk '{printf "%.1f", $1/1024}')
+if [ "$RAM_MB" -lt 400 ]; then
+  warn "RAM: ${RAM_GB}GB — very low (512MB+ recommended). Install may be slow."
+else
+  ok "RAM: ${RAM_GB}GB available"
+fi
+
+# Disk check (minimum 3GB free)
+DISK_FREE_KB=$(df / | awk 'NR==2{print $4}' 2>/dev/null || echo 0)
+DISK_FREE_GB=$(echo "$DISK_FREE_KB" | awk '{printf "%.1f", $1/1024/1024}')
+if [ "$DISK_FREE_KB" -lt 3000000 ]; then
+  warn "Disk: ${DISK_FREE_GB}GB free — low (3GB+ recommended)"
+else
+  ok "Disk: ${DISK_FREE_GB}GB free"
+fi
+
+# Internet check
+sub "Checking internet connection..."
+if curl -sf --connect-timeout 8 --max-time 12 https://google.com > /dev/null 2>&1; then
+  ok "Internet: connected"
+else
+  warn "Internet: slow or limited — downloads may fail. Continuing anyway..."
+fi
+
+# Port 80 check
+sub "Checking port 80..."
+if ss -tlnp 2>/dev/null | grep -q ':80 ' || netstat -tlnp 2>/dev/null | grep -q ':80 '; then
+  USING_80=$(ss -tlnp 2>/dev/null | grep ':80 ' | awk '{print $6}' | head -1 || echo "unknown")
+  warn "Port 80 in use by: $USING_80 — will be reconfigured by Nginx"
+else
+  ok "Port 80: free"
+fi
+
+# Port 8080 (panel API)
+sub "Checking port 8080..."
+if ss -tlnp 2>/dev/null | grep -q ':8080 '; then
+  warn "Port 8080 already in use — may conflict with panel"
+else
+  ok "Port 8080: free"
+fi
+
+# Check for existing NexaPanel
+if [ -d "$PANEL_DIR" ] && systemctl is-active --quiet nexapanel 2>/dev/null; then
+  warn "NexaPanel is already installed and running!"
+  warn "This will UPGRADE/REINSTALL NexaPanel. Existing data is preserved."
+  echo ""
+  read -r -t 15 -p "  Press ENTER to continue, or Ctrl+C to cancel (auto-continues in 15s)... " || true
+fi
+
+echo ""
+ok "Pre-flight checks complete — starting installation"
+echo ""
+
 # ════════════════════════════════════════════════════════════
 # PHASE 1 — PANEL CORE (Node.js + PostgreSQL + Panel itself)
 #           Panel starts FIRST so it can manage everything
 # ════════════════════════════════════════════════════════════
 step "Updating system packages"
-$PKG_UPDATE >> "$LOG" 2>&1 && ok "Package list updated"
+sub "Updating package lists..."
+$PKG_UPDATE 2>&1 | tee -a "$LOG"
+ok "Package list updated"
 
 if [ "$OS_FAMILY" = "debian" ]; then
   $PKG_INSTALL curl wget gnupg2 ca-certificates lsb-release software-properties-common apt-transport-https unzip zip git openssl >> "$LOG" 2>&1 && ok "Base tools installed"
@@ -184,7 +287,7 @@ step "Installing PostgreSQL (NexaPanel internal database)"
 if [ "$OS_FAMILY" = "debian" ]; then
   PG_OK=0
   # Attempt 1: default apt repo
-  if $PKG_INSTALL postgresql postgresql-contrib >> "$LOG" 2>&1 && command -v psql > /dev/null 2>&1; then
+  if pkg_show postgresql postgresql-contrib && command -v psql > /dev/null 2>&1; then
     PG_OK=1
     ok "PostgreSQL installed from default repo"
   fi
@@ -196,10 +299,10 @@ if [ "$OS_FAMILY" = "debian" ]; then
     curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >> "$LOG" 2>&1 || true
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main"       > /etc/apt/sources.list.d/pgdg.list
     $PKG_UPDATE >> "$LOG" 2>&1 || true
-    if $PKG_INSTALL postgresql-16 postgresql-client-16 >> "$LOG" 2>&1 && command -v psql > /dev/null 2>&1; then
+    if pkg_show postgresql-16 postgresql-client-16 && command -v psql > /dev/null 2>&1; then
       PG_OK=1
       ok "PostgreSQL 16 installed from pgdg repo"
-    elif $PKG_INSTALL postgresql postgresql-contrib >> "$LOG" 2>&1 && command -v psql > /dev/null 2>&1; then
+    elif pkg_show postgresql postgresql-contrib && command -v psql > /dev/null 2>&1; then
       PG_OK=1
       ok "PostgreSQL installed from pgdg repo"
     fi
@@ -280,34 +383,52 @@ fi
 # PHASE 2 — Web Stack (installed BEFORE panel starts)
 # ════════════════════════════════════════════════════════════
 step "Installing Nginx"
-NGINX_OK=0
-$PKG_INSTALL nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
+sub "Checking if Nginx is already installed..."
+if is_cmd nginx && svc_active nginx; then
+  ok "Nginx already installed and running — skipping package install"
+  NGINX_OK=1
+else
+  NGINX_OK=0
+fi
 if [ "$NGINX_OK" = "0" ]; then
-  warn "Nginx install failed — retrying with fix-broken..."
-  apt-get -f install -y >> "$LOG" 2>&1 || true
-  apt-get install -y --fix-missing nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
+  sub "Nginx not found — installing..."
+pkg_show nginx && NGINX_OK=1 || true
+if [ "$NGINX_OK" = "0" ]; then
+  warn "Nginx install failed — retrying with dependency fix..."
+  sub "Running: apt-get -f install"
+  apt-get -f install -y 2>&1 | tee -a "$LOG" || true
+  pkg_show nginx && NGINX_OK=1 || true
 fi
 if [ "$NGINX_OK" = "0" ]; then
   warn "Apt nginx failed — trying snap nginx..."
   snap install nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
 fi
-[ "$NGINX_OK" = "1" ] && ok "Nginx installed" || warn "Nginx install still failing — will configure manually"
-systemctl enable nginx >> "$LOG" 2>&1 || true
-systemctl start nginx >> "$LOG" 2>&1 || true
+fi
+[ "$NGINX_OK" = "1" ] && ok "Nginx installed" || warn "Nginx install still failing — check logs"
+sub "Enabling and starting Nginx..."
+systemctl enable nginx 2>&1 | tee -a "$LOG" || true
+systemctl start nginx 2>&1 | tee -a "$LOG" || true
 
 step "Installing PHP 8.3 + extensions"
+sub "Checking if PHP 8.3 is already installed..."
+if is_cmd php8.3 && php8.3 -v > /dev/null 2>&1; then
+  ok "PHP 8.3 already installed: $(php8.3 -r 'echo phpversion();'  2>/dev/null)"
+else
+  sub "PHP 8.3 not found — installing..."
+fi
 if [ "$OS_FAMILY" = "debian" ]; then
   if ! apt-cache show php8.3 > /dev/null 2>&1; then
-    info "Adding ondrej/php PPA for PHP 8.3..."
-    add-apt-repository -y ppa:ondrej/php >> "$LOG" 2>&1 || {
+    sub "Adding PHP 8.3 repository (ondrej/php)..."
+    add-apt-repository -y ppa:ondrej/php 2>&1 | tee -a "$LOG" || {
       curl -sSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg >> "$LOG" 2>&1
       echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php.list
     }
     $PKG_UPDATE >> "$LOG" 2>&1
   fi
   PHP_PKGS="php8.3 php8.3-fpm php8.3-mysql php8.3-pgsql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip php8.3-bcmath php8.3-intl php8.3-soap php8.3-opcache php8.3-cli php8.3-common php8.3-sqlite3"
-  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
-  systemctl enable --now php8.3-fpm >> "$LOG" 2>&1
+  pkg_show $PHP_PKGS || warn "Some PHP extensions may not be available"
+  sub "Starting PHP 8.3-FPM..."
+  systemctl enable --now php8.3-fpm 2>&1 | tee -a "$LOG"
 else
   # RHEL family: use Remi repository for PHP 8.3
   if [ "$MAJOR_VER" -ge 8 ]; then
@@ -316,7 +437,7 @@ else
   # Enable Remi PHP 8.3 module stream
   $PKG_MGR module enable -y php:remi-8.3 >> "$LOG" 2>&1 || true
   PHP_PKGS="php php-fpm php-mysqlnd php-pgsql php-curl php-gd php-mbstring php-xml php-zip php-bcmath php-intl php-soap php-opcache php-cli php-common"
-  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
+  pkg_show $PHP_PKGS || warn "Some PHP extensions may not be available"
   systemctl enable --now php-fpm >> "$LOG" 2>&1
   # On RHEL, www-data is www, set socket permissions
   sed -i 's/^user = apache/user = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
@@ -327,6 +448,14 @@ fi
 ok "PHP 8.3 + extensions installed"
 
 step "Installing MariaDB"
+sub "Checking if MariaDB is already installed..."
+if is_cmd mariadb && svc_active mariadb; then
+  ok "MariaDB already installed and running — skipping package install"
+  MARIADB_OK=1
+else
+  sub "MariaDB not found — installing..."
+  MARIADB_OK=0
+fi
 # Wait for any apt lock to clear (other processes may be updating)
 _LOCK_WAIT=0
 while fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1 || fuser /var/lib/apt/lists/lock > /dev/null 2>&1; do
@@ -338,15 +467,18 @@ done
 
 MARIADB_OK=0
 # Attempt 1: default repo
-$PKG_INSTALL mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
+sub "Trying default apt repository..."
+pkg_show mariadb-server && MARIADB_OK=1 || true
 
 # Attempt 2: add official MariaDB repo
 if [ "$MARIADB_OK" = "0" ] && [ "$OS_FAMILY" = "debian" ]; then
-  warn "Default MariaDB failed — adding official MariaDB 10.11 repo..."
-  apt-get install -y apt-transport-https curl gnupg >> "$LOG" 2>&1 || true
-  curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup     | bash -s -- --mariadb-server-version="mariadb-10.11" >> "$LOG" 2>&1 || true
-  apt-get update -qq >> "$LOG" 2>&1 || true
-  apt-get install -y mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
+  warn "Default MariaDB not found — adding official MariaDB 10.11 repository..."
+  sub "Installing prerequisites..."
+  apt-get install -y apt-transport-https curl gnupg 2>&1 | tee -a "$LOG" || true
+  sub "Adding MariaDB 10.11 repository..."
+  curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash -s -- --mariadb-server-version="mariadb-10.11" 2>&1 | tee -a "$LOG" || true
+  apt-get update 2>&1 | tee -a "$LOG" || true
+  pkg_show mariadb-server && MARIADB_OK=1 || true
 fi
 
 # Attempt 3: fix-broken
@@ -357,8 +489,10 @@ if [ "$MARIADB_OK" = "0" ]; then
 fi
 
 [ "$MARIADB_OK" = "1" ] && ok "MariaDB installed" || warn "MariaDB package install had issues — trying to start anyway"
-systemctl enable mariadb >> "$LOG" 2>&1 || true
-systemctl start mariadb  >> "$LOG" 2>&1 || true
+sub "Enabling and starting MariaDB..."
+systemctl enable mariadb 2>&1 | tee -a "$LOG" || true
+systemctl start mariadb  2>&1 | tee -a "$LOG" || true
+info "Waiting for MariaDB to initialize..."
 sleep 4
 
 # Secure MariaDB — try unix_socket first (default on fresh install), then password
@@ -402,9 +536,21 @@ else
 fi
 
 step "Installing Redis"
-REDIS_OK=0
+sub "Checking if Redis is already installed..."
+if is_cmd redis-server || is_cmd redis-cli; then
+  if svc_active redis-server || svc_active redis; then
+    ok "Redis already installed and running — skipping"
+    REDIS_OK=1
+  else
+    sub "Redis installed but not running — will start it"
+    REDIS_OK=2
+  fi
+else
+  sub "Redis not found — installing..."
+  REDIS_OK=0
+fi
 if [ "$OS_FAMILY" = "debian" ]; then
-  $PKG_INSTALL redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
+  pkg_show redis-server && REDIS_OK=1 || true
   if [ "$REDIS_OK" = "0" ]; then
     apt-get -f install -y >> "$LOG" 2>&1 || true
     apt-get install -y --fix-missing redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
@@ -416,14 +562,18 @@ else
   fi
 fi
 if [ "$REDIS_OK" = "1" ]; then
-  systemctl enable --now "$REDIS_SVC" >> "$LOG" 2>&1 && ok "Redis installed and started ✓" || warn "Redis installed but start failed"
+  ok "Redis already running ✓"
+elif [ "$REDIS_OK" = "2" ]; then
+  sub "Starting Redis..."
+  systemctl enable --now "$REDIS_SVC" 2>&1 | tee -a "$LOG" && ok "Redis started ✓" || warn "Redis start failed"
 else
-  warn "Redis install failed — panel works without Redis (optional cache)"
+  sub "Enabling and starting Redis..."
+  systemctl enable --now "$REDIS_SVC" 2>&1 | tee -a "$LOG" && ok "Redis installed and started ✓" || warn "Redis install failed — panel works without it (optional)"
 fi
 
 step "Installing Certbot"
 if [ "$OS_FAMILY" = "debian" ]; then
-  $PKG_INSTALL certbot python3-certbot-nginx >> "$LOG" 2>&1 && ok "Certbot installed" || warn "Certbot install failed"
+  pkg_show certbot python3-certbot-nginx && ok "Certbot installed" || warn "Certbot install failed"
 else
   # RHEL: Certbot via snap or EPEL
   if command -v snap > /dev/null 2>&1; then
@@ -436,7 +586,8 @@ fi
 step "Configuring Firewall ($FIREWALL_TYPE)"
 if [ "$FIREWALL_TYPE" = "ufw" ]; then
   $PKG_INSTALL ufw >> "$LOG" 2>&1
-  ufw --force reset >> "$LOG" 2>&1
+  sub "Configuring UFW rules..."
+ufw --force reset 2>&1 | tee -a "$LOG"
   ufw default deny incoming >> "$LOG" 2>&1
   ufw default allow outgoing >> "$LOG" 2>&1
   ufw allow 22/tcp comment 'SSH' >> "$LOG" 2>&1
@@ -461,7 +612,7 @@ step "Installing Fail2ban"
 if [ "$NEEDS_EPEL" = "1" ]; then
   $PKG_MGR install -y epel-release >> "$LOG" 2>&1 || true
 fi
-$PKG_INSTALL fail2ban >> "$LOG" 2>&1
+pkg_show fail2ban
 mkdir -p /etc/fail2ban
 cat > /etc/fail2ban/jail.local << 'F2B'
 [DEFAULT]
@@ -484,7 +635,8 @@ systemctl enable --now fail2ban >> "$LOG" 2>&1 && ok "Fail2ban configured"
 # ════════════════════════════════════════════════════════════
 # ── NexaPanel Source ──────────────────────────────────────
 step "Downloading NexaPanel"
-useradd -r -m -d "$PANEL_DIR" -s /bin/bash "$PANEL_USER" 2>/dev/null || true
+sub "Creating nexapanel system user..."
+useradd -r -m -d "$PANEL_DIR" -s /bin/bash "$PANEL_USER" 2>/dev/null && ok "User 'nexapanel' created" || info "User 'nexapanel' already exists"
 usermod -aG shadow "$PANEL_USER" 2>/dev/null || true
 if [ "$OS_FAMILY" = "debian" ]; then
   $PKG_INSTALL python3-pam >> "$LOG" 2>&1 && ok "python3-pam installed" || warn "python3-pam not available"
@@ -517,9 +669,11 @@ ok "Environment configured"
 set -a; source "$ENV_FILE"; set +a
 # ── Download pre-built backend bundle ─────────────────────
 step "Downloading NexaPanel backend"
+info "Sources: 1) nexapanel.hostganga.com  2) GitHub  3) Live server"
 BUNDLE_TMP="/tmp/nexapanel-bundle-$$.tar.gz"
 BUNDLE_OK=0
 mkdir -p "$PANEL_DIR/artifacts/api-server/dist"
+sub "Trying download sources in order..."
 for _BSRC in \
   "${HOSTING_URL}/bundle.tar.gz" \
   "${GITHUB_RAW}/bundle.tar.gz" \
@@ -546,9 +700,11 @@ rm -f "$BUNDLE_TMP"
 
 # ── Download pre-built frontend ────────────────────────────
 step "Downloading NexaPanel frontend"
+info "Sources: 1) nexapanel.hostganga.com  2) GitHub  3) Live server"
 FE_TMP="/tmp/nexapanel-fe-$$.tar.gz"
 FE_OK=0
 mkdir -p "$PANEL_DIR/artifacts/nexapanel/dist"
+sub "Trying download sources in order..."
 for _FSRC in \
   "${HOSTING_URL}/frontend-dist.tar.gz" \
   "${GITHUB_RAW}/frontend-dist.tar.gz" \
@@ -575,6 +731,7 @@ cd "$PANEL_DIR"
 
 # ── DB Migrations (pure SQL, no drizzle-kit needed) ───────
 step "Setting up database (tables + admin account)"
+sub "Verifying PostgreSQL connection..."
 
 MIGRATION_SQL="/tmp/nexapanel_migrate_$$.sql"
 cat > "$MIGRATION_SQL" << 'ENDSQL'
@@ -825,7 +982,9 @@ if ! PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -
   fi
   PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -c 'SELECT 1' >> "$LOG" 2>&1     && ok "PostgreSQL self-heal succeeded ✓"     || fail "PostgreSQL connection failed — check $LOG then run: curl -sSL https://nexapanel.hostganga.com/pg-fix.sh | sudo bash"
 fi
-PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -f "$MIGRATION_SQL" >> "$LOG" 2>&1   && ok "All database tables created"   || fail "Database migration failed — check $LOG"
+sub "Running database migrations..."
+PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -f "$MIGRATION_SQL" 2>&1 | tee -a "$LOG"
+[ "${PIPESTATUS[0]}" = "0" ] && ok "All database tables created" || fail "Database migration failed — check $LOG"
 rm -f "$MIGRATION_SQL"
 
 # Grant schema privileges after table creation
@@ -959,9 +1118,12 @@ fi
 # Ensure nginx is running before test
 systemctl start nginx >> "$LOG" 2>&1 || true
 sleep 2
-if nginx -t >> "$LOG" 2>&1; then
-  systemctl reload nginx >> "$LOG" 2>&1 || systemctl restart nginx >> "$LOG" 2>&1 || true
-  ok "Nginx configured ✓"
+sub "Testing Nginx configuration..."
+nginx -t 2>&1 | tee -a "$LOG"
+if [ "${PIPESTATUS[0]}" = "0" ]; then
+  sub "Reloading Nginx..."
+  systemctl reload nginx 2>&1 | tee -a "$LOG" || systemctl restart nginx 2>&1 | tee -a "$LOG" || true
+  ok "Nginx configured and reloaded ✓"
 else
   warn "Nginx config test failed — check: nginx -t"
 fi
@@ -993,25 +1155,35 @@ SyslogIdentifier=nexapanel
 WantedBy=multi-user.target
 SERVICE
 
-systemctl daemon-reload >> "$LOG" 2>&1
-systemctl enable nexapanel >> "$LOG" 2>&1
-systemctl start nexapanel >> "$LOG" 2>&1
+sub "Reloading systemd daemon..."
+systemctl daemon-reload 2>&1 | tee -a "$LOG"
+sub "Enabling nexapanel service..."
+systemctl enable nexapanel 2>&1 | tee -a "$LOG"
+sub "Starting nexapanel service..."
+systemctl start nexapanel 2>&1 | tee -a "$LOG"
 
 # Wait for panel to be ready (up to 30s)
+sub "Waiting for NexaPanel API to be ready..."
 PANEL_READY=0
-for i in $(seq 1 10); do
+for i in $(seq 1 15); do
+  printf "  ${CYAN}→${NC} Attempt %d/15 — waiting for API on port %d...\r" "$i" "$PANEL_PORT"
   sleep 3
   if curl -sf --connect-timeout 3 "http://127.0.0.1:${PANEL_PORT}/api/healthz" > /dev/null 2>&1; then
-    ok "NexaPanel API is responding ✓ (took $((i*3))s)"
+    echo ""
+    ok "NexaPanel API is responding ✓  (took $((i*3))s)"
     PANEL_READY=1
     break
   fi
 done
+echo ""
 if [ "$PANEL_READY" = "0" ]; then
-  warn "Panel not responding yet — checking service status..."
-  systemctl is-active --quiet nexapanel && info "Service is running (may need more time)" || {
-    journalctl -u nexapanel -n 20 --no-pager | tee -a "$LOG"
-  }
+  warn "Panel not responding after 45s — checking service logs..."
+  echo "  ┌── Last 25 log lines ──────────────────────────────────" | tee -a "$LOG"
+  journalctl -u nexapanel -n 25 --no-pager 2>&1 | sed 's/^/  │ /' | tee -a "$LOG"
+  echo "  └───────────────────────────────────────────────────────" | tee -a "$LOG"
+  systemctl is-active --quiet nexapanel \
+    && warn "Service is running but API not responding — may need more time" \
+    || fail "nexapanel service crashed — see logs above and fix before continuing"
 fi
 
 # Auto-request trial license from hostganga.com (via Node.js API on nexapanel.hostganga.com)
@@ -1058,7 +1230,8 @@ step "Installing phpMyAdmin"
 PMA_VERSION="5.2.1"
 PMA_URL="https://files.phpmyadmin.net/phpMyAdmin/${PMA_VERSION}/phpMyAdmin-${PMA_VERSION}-all-languages.tar.gz"
 mkdir -p "$PMA_DIR"
-if curl -sSL "$PMA_URL" | tar -xz -C "$PMA_DIR" --strip-components=1 >> "$LOG" 2>&1; then
+sub "Downloading phpMyAdmin ${PMA_VERSION}..."
+if curl -sSL --progress-bar "$PMA_URL" 2>&1 | tar -xz -C "$PMA_DIR" --strip-components=1 2>&1 | tee -a "$LOG"; then
   cp "$PMA_DIR/config.sample.inc.php" "$PMA_DIR/config.inc.php"
   BLOWFISH=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*' | head -c 32)
   sed -i "s/\$cfg\['blowfish_secret'\] = ''/\$cfg['blowfish_secret'] = '${BLOWFISH}'/" "$PMA_DIR/config.inc.php"
@@ -1258,11 +1431,23 @@ echo -e "    nexapanel-repair --update        # Repair + update to latest"
 echo -e "    nexapanel-repair --update-only   # Update bundle only"
 echo -e "    systemctl status nexapanel       # Panel service status"
 echo ""
-echo -e "Service status:"
-echo -e "  nexapanel:  $(systemctl is-active nexapanel)"
-echo -e "  nginx:      $(systemctl is-active nginx)"
-echo -e "  php8.3-fpm: $(systemctl is-active php8.3-fpm 2>/dev/null || echo 'not installed yet')"
-echo -e "  mariadb:    $(systemctl is-active mariadb 2>/dev/null || echo 'not installed yet')"
-echo -e "  postgresql: $(systemctl is-active postgresql)"
-echo -e "  redis:      $(systemctl is-active redis-server 2>/dev/null || echo 'not installed yet')"
+echo -e "Service Status:"
+echo ""
+_svc_status() {
+  local svc=$1 label=$2
+  local st; st=$(systemctl is-active "$svc" 2>/dev/null || echo "not found")
+  if [ "$st" = "active" ]; then
+    printf "  ${GREEN}✓${NC}  %-18s ${GREEN}%s${NC}\n" "$label" "running"
+  elif [ "$st" = "inactive" ]; then
+    printf "  ${YELLOW}○${NC}  %-18s ${YELLOW}%s${NC}\n" "$label" "stopped"
+  else
+    printf "  ${RED}✗${NC}  %-18s ${RED}%s${NC}\n" "$label" "$st"
+  fi
+}
+_svc_status nexapanel      "NexaPanel"
+_svc_status nginx          "Nginx"
+_svc_status "php8.3-fpm"   "PHP 8.3-FPM"
+_svc_status mariadb        "MariaDB"
+_svc_status postgresql     "PostgreSQL"
+_svc_status redis-server   "Redis"
 echo ""
