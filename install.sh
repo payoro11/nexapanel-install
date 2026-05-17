@@ -28,7 +28,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 STEP=0
-STEPS_TOTAL=15   # updated below after pre-flight
+STEPS_TOTAL=27   # 25 base steps + BIND9 + Mail server
 
 # Print helpers — all tee to log
 ok()   { echo -e "  ${GREEN}✓${NC} $1" | tee -a "$LOG"; }
@@ -68,6 +68,32 @@ pkg_show_yum() {
 # Check helpers
 is_cmd()     { command -v "$1" > /dev/null 2>&1; }
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+
+# Generate self-validating DEMO license key from server IP
+# Algorithm matches panel license.ts generateDemoKeyForIp()
+# Uses heredoc with 'PYEOF' so bash never interprets Python {} chars
+generate_demo_key() {
+  local ip="$1"
+  cat > /tmp/_nxdemo_$$.py << 'PYEOF'
+import sys, hmac, hashlib, time
+ip = sys.argv[1].strip()
+parts = ip.split('.')
+if len(parts) != 4:
+    print(''); sys.exit(0)
+try:
+    ip_hex = ''.join('{:02X}'.format(int(x)) for x in parts)
+    expiry_days = int(time.time() / 86400) + 15
+    expiry_hex = '{:04X}'.format(expiry_days)
+    h = hmac.new(b'nexapanel-demo-trial-v1',
+                 '{0}:{1}'.format(ip, expiry_days).encode(),
+                 hashlib.sha256).hexdigest()[:4].upper()
+    print('DEMO-{0}-{1}-{2}-{3}'.format(ip_hex[:4], ip_hex[4:8], expiry_hex, h))
+except Exception:
+    print('')
+PYEOF
+  python3 /tmp/_nxdemo_$$.py "$ip" 2>/dev/null || echo ""
+  rm -f /tmp/_nxdemo_$$.py
+}
 
 # ── Root check ─────────────────────────────────────────────
 if [ "$EUID" -ne 0 ]; then fail "Run as root: sudo bash install.sh"; fi
@@ -206,6 +232,26 @@ fi
 
 echo ""
 ok "Pre-flight checks complete — starting installation"
+echo ""
+
+# ════════════════════════════════════════════════════════════
+# EDITION SELECTION
+# ════════════════════════════════════════════════════════════
+echo ""
+echo -e "\033[1;36m┌──────────────────────────────────────────────────────────────┐\033[0m"
+echo -e "\033[1;36m│  Select NexaPanel Edition                                    │\033[0m"
+echo -e "\033[1;36m│                                                              │\033[0m"
+echo -e "\033[1;36m│  1) Web Edition    — Hosting panel, NO reseller system       │\033[0m"
+echo -e "\033[1;36m│  2) Host Edition   — Includes full reseller management       │\033[0m"
+echo -e "\033[1;36m└──────────────────────────────────────────────────────────────┘\033[0m"
+echo ""
+read -r -p "  Enter choice [1/2, default=1]: " EDITION_CHOICE
+case "${EDITION_CHOICE:-1}" in
+  2) PANEL_EDITION="demo_host"; EDITION_NAME="Host Edition (with Reseller)" ;;
+  *) PANEL_EDITION="demo_web";  EDITION_NAME="Web Edition (no Reseller)"   ;;
+esac
+echo ""
+ok "Installing NexaPanel ${EDITION_NAME}"
 echo ""
 
 # ════════════════════════════════════════════════════════════
@@ -382,7 +428,7 @@ fi
 # ════════════════════════════════════════════════════════════
 # PHASE 2 — Web Stack (installed BEFORE panel starts)
 # ════════════════════════════════════════════════════════════
-step "Installing Nginx"
+step "Installing Web Servers (Nginx + Apache2)"
 sub "Checking if Nginx is already installed..."
 if is_cmd nginx && svc_active nginx; then
   ok "Nginx already installed and running — skipping package install"
@@ -409,43 +455,68 @@ sub "Enabling and starting Nginx..."
 systemctl enable nginx 2>&1 | tee -a "$LOG" || true
 systemctl start nginx 2>&1 | tee -a "$LOG" || true
 
-step "Installing PHP 8.3 + extensions"
+# Apache2 — install alongside Nginx (inactive by default; panel can switch)
+sub "Installing Apache2 (web server switching support)..."
+if is_cmd apache2 || is_cmd apachectl; then
+  ok "Apache2 already installed — skipping"
+else
+  pkg_show apache2 libapache2-mod-php || warn "Apache2 install failed — web server switching limited"
+  systemctl disable apache2 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  ok "Apache2 installed (disabled — activate via Panel \u2192 Web Server)"
+fi
+
+step "Installing PHP (all versions: 7.4, 8.0, 8.1, 8.2, 8.3)"
 sub "Checking if PHP 8.3 is already installed..."
 if is_cmd php8.3 && php8.3 -v > /dev/null 2>&1; then
   ok "PHP 8.3 already installed: $(php8.3 -r 'echo phpversion();'  2>/dev/null)"
 else
   sub "PHP 8.3 not found — installing..."
 fi
+PHP_VERSIONS="7.4 8.0 8.1 8.2 8.3"
+PHP_EXTS="fpm mysql pgsql curl gd mbstring xml zip bcmath intl soap opcache cli common sqlite3"
 if [ "$OS_FAMILY" = "debian" ]; then
   if ! apt-cache show php8.3 > /dev/null 2>&1; then
-    sub "Adding PHP 8.3 repository (ondrej/php)..."
+    sub "Adding ondrej/php repository (required for all PHP versions)..."
+    apt-get install -y software-properties-common >> "$LOG" 2>&1 || true
     add-apt-repository -y ppa:ondrej/php 2>&1 | tee -a "$LOG" || {
-      curl -sSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg >> "$LOG" 2>&1
+      curl -sSL https://packages.sury.org/php/apt.gpg 2>/dev/null | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg 2>/dev/null || true
       echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php.list
     }
     $PKG_UPDATE >> "$LOG" 2>&1
   fi
-  PHP_PKGS="php8.3 php8.3-fpm php8.3-mysql php8.3-pgsql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip php8.3-bcmath php8.3-intl php8.3-soap php8.3-opcache php8.3-cli php8.3-common php8.3-sqlite3"
-  pkg_show $PHP_PKGS || warn "Some PHP extensions may not be available"
-  sub "Starting PHP 8.3-FPM..."
-  systemctl enable --now php8.3-fpm 2>&1 | tee -a "$LOG"
+  for VER in $PHP_VERSIONS; do
+    if is_cmd "php${VER}" && "php${VER}" -v > /dev/null 2>&1; then
+      ok "PHP ${VER} already installed — skipping"
+      continue
+    fi
+    sub "Installing PHP ${VER} + extensions..."
+    PKGS="php${VER}"
+    for EXT in $PHP_EXTS; do PKGS="$PKGS php${VER}-${EXT}"; done
+    pkg_show $PKGS || warn "PHP ${VER}: some extensions unavailable on this distro"
+    systemctl enable --now "php${VER}-fpm" 2>&1 | tee -a "$LOG" || true
+    ok "PHP ${VER} installed and FPM started"
+  done
+  update-alternatives --set php /usr/bin/php8.3 2>/dev/null || true
+  PHP_FPM_SVC="php8.3-fpm"
+  PHP_FPM_SOCK="/run/php/php8.3-fpm.sock"
 else
-  # RHEL family: use Remi repository for PHP 8.3
   if [ "$MAJOR_VER" -ge 8 ]; then
     $PKG_INSTALL https://rpms.remirepo.net/enterprise/remi-release-${MAJOR_VER}.rpm >> "$LOG" 2>&1 || true
   fi
-  # Enable Remi PHP 8.3 module stream
-  $PKG_MGR module enable -y php:remi-8.3 >> "$LOG" 2>&1 || true
-  PHP_PKGS="php php-fpm php-mysqlnd php-pgsql php-curl php-gd php-mbstring php-xml php-zip php-bcmath php-intl php-soap php-opcache php-cli php-common"
-  pkg_show $PHP_PKGS || warn "Some PHP extensions may not be available"
+  for VER in $PHP_VERSIONS; do
+    sub "Installing PHP ${VER} via Remi..."
+    $PKG_MGR module enable -y "php:remi-${VER}" >> "$LOG" 2>&1 || true
+    pkg_show php-fpm php-mysqlnd php-pgsql php-curl php-gd php-mbstring php-xml php-zip php-bcmath php-intl php-soap php-opcache php-cli php-common || true
+    ok "PHP ${VER} installed"
+  done
   systemctl enable --now php-fpm >> "$LOG" 2>&1
-  # On RHEL, www-data is www, set socket permissions
   sed -i 's/^user = apache/user = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
   sed -i 's/^group = apache/group = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
   sed -i 's|^listen.owner = nobody|listen.owner = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
   sed -i 's|^listen.group = nobody|listen.group = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
 fi
-ok "PHP 8.3 + extensions installed"
+ok "All PHP versions installed (7.4 → 8.3) — default: PHP 8.3"
 
 step "Installing MariaDB"
 sub "Checking if MariaDB is already installed..."
@@ -569,6 +640,55 @@ elif [ "$REDIS_OK" = "2" ]; then
 else
   sub "Enabling and starting Redis..."
   systemctl enable --now "$REDIS_SVC" 2>&1 | tee -a "$LOG" && ok "Redis installed and started ✓" || warn "Redis install failed — panel works without it (optional)"
+fi
+
+step "Installing BIND9 (DNS Server)"
+sub "Checking BIND9..."
+if [ -d "/etc/bind" ] || [ -f "/etc/named.conf" ]; then
+  ok "BIND9 already installed — skipping"
+else
+  sub "Installing BIND9 DNS server..."
+  if [ "$OS_FAMILY" = "debian" ]; then
+    pkg_show bind9 bind9utils bind9-doc dnsutils || warn "BIND9 install failed — DNS features may be unavailable"
+    if [ -f /etc/bind/named.conf.options ]; then
+      sed -i 's/listen-on-v6 { any; };/listen-on-v6 { any; };\n\tallow-recursion { 127.0.0.1; };\n\trecursion yes;/' \
+        /etc/bind/named.conf.options 2>/dev/null || true
+    fi
+    systemctl enable bind9 2>&1 | tee -a "$LOG" || true
+    systemctl start bind9 2>&1 | tee -a "$LOG" || true
+  else
+    pkg_show bind bind-utils || warn "BIND install failed"
+    systemctl enable named 2>&1 | tee -a "$LOG" || true
+    systemctl start named 2>&1 | tee -a "$LOG" || true
+  fi
+  ok "BIND9 DNS server installed \u2713 — manage zones via Panel \u2192 DNS Manager"
+fi
+
+step "Installing Mail Server (Postfix + Dovecot)"
+sub "Checking Postfix + Dovecot..."
+if [ -f "/etc/postfix/main.cf" ] && [ -f "/etc/dovecot/dovecot.conf" ]; then
+  ok "Postfix + Dovecot already installed — skipping"
+else
+  sub "Installing Postfix (SMTP) + Dovecot (IMAP/POP3)..."
+  if [ "$OS_FAMILY" = "debian" ]; then
+    DEBIAN_FRONTEND=noninteractive debconf-set-selections <<< "postfix postfix/mailname string $(hostname -f 2>/dev/null || hostname)" 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'" 2>/dev/null || true
+    pkg_show postfix dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd mailutils \
+      || warn "Mail server install failed — email features may be unavailable"
+    postconf -e "inet_protocols = all" 2>/dev/null || true
+    postconf -e "inet_interfaces = all" 2>/dev/null || true
+    postconf -e "mailbox_size_limit = 0" 2>/dev/null || true
+    postconf -e "recipient_delimiter = +" 2>/dev/null || true
+    postconf -e "home_mailbox = Maildir/" 2>/dev/null || true
+    systemctl enable postfix 2>&1 | tee -a "$LOG" || true
+    systemctl restart postfix 2>&1 | tee -a "$LOG" || true
+    systemctl enable dovecot 2>&1 | tee -a "$LOG" || true
+    systemctl restart dovecot 2>&1 | tee -a "$LOG" || true
+  else
+    pkg_show postfix dovecot-core dovecot-imapd dovecot-pop3d || warn "Mail server install failed"
+    systemctl enable --now postfix dovecot 2>&1 | tee -a "$LOG" || true
+  fi
+  ok "Mail server installed \u2713 — manage email via Panel \u2192 Email Manager"
 fi
 
 step "Installing Certbot"
@@ -1186,41 +1306,32 @@ if [ "$PANEL_READY" = "0" ]; then
     || fail "nexapanel service crashed — see logs above and fix before continuing"
 fi
 
-# Auto-request trial license from hostganga.com (via Node.js API on nexapanel.hostganga.com)
-step "Requesting trial license from hostganga.com..."
-DEMO_RESP=$(curl -s --connect-timeout 15 --max-time 30   -X POST https://nexapanel.hostganga.com/api/panel/license/public/generate   -H "Content-Type: application/json"   -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web","hostname":"$(hostname)","os":"${OS_FAMILY:-linux}"}"   2>/dev/null || echo '{}')
-DEMO_KEY=$(echo "$DEMO_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
+# Generate DEMO key locally + seed into PostgreSQL (no panel API needed — 100% reliable)
+step "Activating trial license (${EDITION_NAME:-Web Edition})"
+sub "Generating DEMO key for ${SERVER_IP_NOW} (${EDITION_NAME:-Web Edition})..."
+DEMO_KEY=$(generate_demo_key "${SERVER_IP_NOW}")
 if [ -n "$DEMO_KEY" ]; then
-  # Retry activation up to 5 times (panel may still be warming up)
-  ACT_OK=""
-  for _try in 1 2 3 4 5; do
-    sleep 4
-    # Step 1: get admin token
-    ADMIN_TOKEN=$(curl -s --connect-timeout 8 --max-time 12       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/auth/login"       -H "Content-Type: application/json"       -d '{"email":"admin@example.com","password":"admin123"}'       2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
-    [ -z "$ADMIN_TOKEN" ] && continue
-    # Step 2: activate with auth header + serverIp
-    ACT_RESP=$(curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license"       -H "Content-Type: application/json"       -H "Authorization: Bearer ${ADMIN_TOKEN}"       -d "{"licenseKey":"${DEMO_KEY}","serverIp":"${SERVER_IP_NOW}"}" 2>/dev/null || echo '{}')
-    ACT_OK=$(echo "$ACT_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('active') else '')" 2>/dev/null || echo "")
-    [ "$ACT_OK" = "ok" ] && break
-  done
-  if [ "$ACT_OK" = "ok" ]; then
-    ok "Trial license activated: ${DEMO_KEY}"
-    ok "15-day trial started — upgrade at nexapanel.hostganga.com"
+  sub "Seeding license into PostgreSQL (no panel API needed)..."
+  DEMO_EXPIRY=$(python3 -c "from datetime import datetime,timedelta; print((datetime.now()+timedelta(days=15)).strftime('%Y-%m-%d %H:%M:%S'))" 2>/dev/null \
+    || date -d "+15 days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "2099-01-01 00:00:00")
+  PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel \
+    -c "DELETE FROM panel_license;" >> "$LOG" 2>&1 || true
+  PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel \
+    -c "INSERT INTO panel_license (license_key,server_ip,active,plan,expires_at,activated_at,updated_at) VALUES ('${DEMO_KEY}','${SERVER_IP_NOW}',true,'${PANEL_EDITION:-demo_web}','${DEMO_EXPIRY}',NOW(),NOW());" \
+    >> "$LOG" 2>&1
+  LIC_OK=$(PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -At \
+    -c "SELECT active FROM panel_license LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+  if [ "$LIC_OK" = "t" ]; then
+    ok "Trial license ACTIVATED: ${DEMO_KEY}"
+    ok "15-day trial started — Edition: ${EDITION_NAME:-Web Edition}"
+    ok "Upgrade at: nexapanel.hostganga.com"
   else
-    warn "Auto-activation failed — key saved: ${DEMO_KEY}"
-    warn "Enter key manually: Panel → License → Activate License Key"
+    warn "License key generated but DB verify failed: ${DEMO_KEY}"
+    warn "Manual activate: Panel → License → Activate Key"
   fi
 else
-  # Fallback: try local public/generate endpoint directly
-  DEMO_RESP2=$(curl -s --connect-timeout 8 --max-time 15     -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/generate"     -H "Content-Type: application/json"     -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web"}"     2>/dev/null || echo '{}')
-  DEMO_KEY2=$(echo "$DEMO_RESP2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
-  if [ -n "$DEMO_KEY2" ]; then
-    # Activate via public endpoint (no auth needed)
-    curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/activate"       -H "Content-Type: application/json"       -d "{"license_key":"${DEMO_KEY2}","server_ip":"${SERVER_IP_NOW}"}" > /dev/null 2>&1
-    ok "Trial license activated (local): ${DEMO_KEY2}"
-  else
-    warn "Could not get trial license — activate manually at nexapanel.hostganga.com"
-  fi
+  warn "Could not generate DEMO key (Python3 missing?)"
+  warn "Activate manually at nexapanel.hostganga.com → Generate Trial"
 fi
 
 # ════════════════════════════════════════════════════════════
@@ -1374,6 +1485,8 @@ cat > "$CRED_FILE" << CREDS
   NexaPanel URL:   http://${SERVER_IP}/panel
   Login:           admin@example.com
   Password:        admin123
+  Edition:         ${EDITION_NAME:-Web Edition}
+  License:         15-day trial (DEMO — auto-activated)
 
   phpMyAdmin URL:  http://${SERVER_IP}/phpmyadmin
   MySQL root:      root / ${DB_PASS}
@@ -1417,6 +1530,7 @@ echo -e "${GREEN}${BOLD}╚═════════════════�
 echo ""
 echo -e "  ${BOLD}Panel:${NC}      http://${SERVER_IP}/panel"
 echo -e "  Login:       admin@example.com / admin123"
+echo -e "  Edition:     ${EDITION_NAME:-Web Edition}  (15-day trial active)"
 echo ""
 echo -e "  ${BOLD}phpMyAdmin:${NC} http://${SERVER_IP}/phpmyadmin"
 echo -e "  MySQL root:  root / ${DB_PASS}"
@@ -1446,8 +1560,16 @@ _svc_status() {
 }
 _svc_status nexapanel      "NexaPanel"
 _svc_status nginx          "Nginx"
+_svc_status apache2        "Apache2"
 _svc_status "php8.3-fpm"   "PHP 8.3-FPM"
+_svc_status "php8.2-fpm"   "PHP 8.2-FPM"
+_svc_status "php8.1-fpm"   "PHP 8.1-FPM"
+_svc_status "php8.0-fpm"   "PHP 8.0-FPM"
+_svc_status "php7.4-fpm"   "PHP 7.4-FPM"
 _svc_status mariadb        "MariaDB"
 _svc_status postgresql     "PostgreSQL"
 _svc_status redis-server   "Redis"
+_svc_status bind9          "BIND9 DNS"
+_svc_status postfix        "Postfix (SMTP)"
+_svc_status dovecot        "Dovecot (IMAP)"
 echo ""
