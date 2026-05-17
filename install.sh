@@ -14,6 +14,7 @@
 set -uo pipefail
 
 HOSTING_URL="https://nexapanel.hostganga.com"
+GITHUB_RAW="https://raw.githubusercontent.com/payoro11/nexapanel-install/main"
 PANEL_URL="http://151.158.180.29"
 PANEL_DIR="/opt/nexapanel"
 PANEL_PORT=8080
@@ -49,7 +50,7 @@ cat << 'NEXABANNER'
 NEXABANNER
 printf '\033[0m'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.6\033[0m\n'
+printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.7\033[0m\n'
 printf '\033[38;5;208m  A Brand of \033[1;37mNexaroot Technology India Pvt Ltd\033[0m  \033[38;5;208m•  Powered By \033[1;37mHOSTGANGA.COM\033[0m\n'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\n'
@@ -307,58 +308,57 @@ chmod 600 "$ENV_FILE"
 ok "Environment configured"
 
 set -a; source "$ENV_FILE"; set +a
-
 # ── Download pre-built backend bundle ─────────────────────
 step "Downloading NexaPanel backend"
-BUNDLE_TMP="/tmp/nexapanel-bundle-$$.mjs"
-# Try hosting first, live server as fallback
-BUNDLE_HTTP=$(curl -fsSL --connect-timeout 30 --max-time 120   -w "%{http_code}" -o "$BUNDLE_TMP" "${HOSTING_URL}/bundle.tar.gz" 2>> "$LOG")
-if [ "$BUNDLE_HTTP" = "200" ] && [ -s "$BUNDLE_TMP" ]; then
-  mkdir -p "$PANEL_DIR/artifacts/api-server/dist"
-  tar -xzf "$BUNDLE_TMP" -C "$PANEL_DIR/artifacts/api-server/dist" 2>> "$LOG"     && ok "Backend bundle extracted from hosting"     || { rm -f "$BUNDLE_TMP"
-         warn "Tarball extract failed — trying live server fallback..."
-         BUNDLE_HTTP="000"; }
-fi
-if [ "$BUNDLE_HTTP" != "200" ]; then
-  BUNDLE_HTTP=$(curl -fsSL --connect-timeout 30 --max-time 120     -w "%{http_code}" -o "$BUNDLE_TMP" "${PANEL_URL}/api/panel/bundle" 2>> "$LOG")
-fi
-if [ "$BUNDLE_HTTP" = "200" ] && [ -s "$BUNDLE_TMP" ]; then
-  mv "$BUNDLE_TMP" "$PANEL_DIR/artifacts/api-server/dist/index.mjs"
-  ok "Backend bundle downloaded"
-else
+BUNDLE_TMP="/tmp/nexapanel-bundle-$$.tar.gz"
+BUNDLE_OK=0
+mkdir -p "$PANEL_DIR/artifacts/api-server/dist"
+for _BSRC in \
+  "${HOSTING_URL}/bundle.tar.gz" \
+  "${GITHUB_RAW}/bundle.tar.gz" \
+  "${PANEL_URL}/api/panel/bundle"; do
+  info "Backend bundle: trying $_BSRC"
+  _BHTTP=$(curl -fsSL --connect-timeout 30 --max-time 120 \
+    -w "%{http_code}" -o "$BUNDLE_TMP" "$_BSRC" 2>> "$LOG")
+  if [ "$_BHTTP" = "200" ] && [ -s "$BUNDLE_TMP" ]; then
+    if echo "$_BSRC" | grep -q "\.tar\.gz"; then
+      tar -xzf "$BUNDLE_TMP" -C "$PANEL_DIR/artifacts/api-server/dist" >> "$LOG" 2>&1 \
+        && BUNDLE_OK=1 && ok "Backend bundle ready (from $_BSRC)" && break
+      warn "Extract failed from $_BSRC"
+    else
+      mv "$BUNDLE_TMP" "$PANEL_DIR/artifacts/api-server/dist/index.mjs" \
+        && BUNDLE_OK=1 && ok "Backend bundle ready (from $_BSRC)" && break
+    fi
+  fi
+  warn "Failed (_BHTTP=$_BHTTP) from $_BSRC"
   rm -f "$BUNDLE_TMP"
-  fail "Backend bundle download failed (HTTP $BUNDLE_HTTP) — check $LOG"
-fi
+done
+rm -f "$BUNDLE_TMP"
+[ "$BUNDLE_OK" = "0" ] && fail "Backend bundle download failed from all sources"
 
-# ── Download pre-built frontend from GitHub ───────────────
+
+# ── Download pre-built frontend ────────────────────────────
 step "Downloading NexaPanel frontend"
 FE_TMP="/tmp/nexapanel-fe-$$.tar.gz"
-GITHUB_FE="${HOSTING_URL}/frontend-dist.tar.gz"
-info "Downloading frontend from GitHub..."
-FE_HTTP=$(curl -fsSL --connect-timeout 30 --max-time 180 -L \
-  -w "%{http_code}" -o "$FE_TMP" "$GITHUB_FE" 2>> "$LOG")
-if [ "$FE_HTTP" = "200" ] && [ -s "$FE_TMP" ]; then
-  mkdir -p "$PANEL_DIR/artifacts/nexapanel/dist"
-  tar -xzf "$FE_TMP" -C "$PANEL_DIR/artifacts/nexapanel/dist" >> "$LOG" 2>&1
-  rm -f "$FE_TMP"
-  ok "Frontend downloaded from GitHub"
-else
-  rm -f "$FE_TMP"
-  info "GitHub fallback — trying live server..."
-  FE_HTTP2=$(curl -fsSL --connect-timeout 30 --max-time 180 \
-    -w "%{http_code}" -o "$FE_TMP" "${PANEL_URL}/api/panel/frontend-dist.tar.gz" 2>> "$LOG") || true
-    # Also try hosting as secondary fallback
-    [ "${FE_HTTP2:-000}" != "200" ] && FE_HTTP2=$(curl -fsSL --connect-timeout 30 --max-time 120       -w "%{http_code}" -o "$FE_TMP" "${HOSTING_URL}/frontend-dist.tar.gz" 2>> "$LOG")
-  if [ "$FE_HTTP2" = "200" ] && [ -s "$FE_TMP" ]; then
-    mkdir -p "$PANEL_DIR/artifacts/nexapanel/dist"
-    tar -xzf "$FE_TMP" -C "$PANEL_DIR/artifacts/nexapanel/dist" >> "$LOG" 2>&1
-    rm -f "$FE_TMP"
-    ok "Frontend downloaded from live server"
-  else
-    rm -f "$FE_TMP"
-    fail "Frontend download failed — check internet and try again"
+FE_OK=0
+mkdir -p "$PANEL_DIR/artifacts/nexapanel/dist"
+for _FSRC in \
+  "${HOSTING_URL}/frontend-dist.tar.gz" \
+  "${GITHUB_RAW}/frontend-dist.tar.gz" \
+  "${PANEL_URL}/api/panel/frontend-dist.tar.gz"; do
+  info "Frontend: trying $_FSRC"
+  _FHTTP=$(curl -fsSL --connect-timeout 30 --max-time 180 -L \
+    -w "%{http_code}" -o "$FE_TMP" "$_FSRC" 2>> "$LOG")
+  if [ "$_FHTTP" = "200" ] && [ -s "$FE_TMP" ]; then
+    tar -xzf "$FE_TMP" -C "$PANEL_DIR/artifacts/nexapanel/dist" >> "$LOG" 2>&1 \
+      && FE_OK=1 && ok "Frontend ready (from $_FSRC)" && break
+    warn "Extract failed from $_FSRC"
   fi
-fi
+  warn "Failed (_FHTTP=$_FHTTP) from $_FSRC"
+  rm -f "$FE_TMP"
+done
+rm -f "$FE_TMP"
+[ "$FE_OK" = "0" ] && fail "Frontend download failed from all sources — check internet connection"
 
 # ── Install native runtime packages (cannot be bundled by esbuild) ──
 step "Installing native runtime packages"
