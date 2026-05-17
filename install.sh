@@ -114,7 +114,7 @@ cat << 'NEXABANNER'
 NEXABANNER
 printf '\033[0m'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.9\033[0m\n'
+printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.12\033[0m\n'
 printf '\033[38;5;208m  A Brand of \033[1;37mNexaroot Technology India Pvt Ltd\033[0m  \033[38;5;208m•  Powered By \033[1;37mHOSTGANGA.COM\033[0m\n'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\n'
@@ -458,32 +458,47 @@ systemctl start nginx 2>&1 | tee -a "$LOG" || true
 # Apache2 — install alongside Nginx (inactive by default; panel can switch)
 sub "Installing Apache2 (web server switching support)..."
 if is_cmd apache2 || is_cmd apachectl; then
-  ok "Apache2 already installed — skipping"
-else
-  pkg_show apache2 libapache2-mod-php || warn "Apache2 install failed — web server switching limited"
+  ok "Apache2 already installed — reconfiguring ports..."
+  # Ensure Apache2 is not trying to use port 80 (Nginx owns it)
+  sed -i 's/^Listen 80$/Listen 8080/' /etc/apache2/ports.conf 2>/dev/null || true
+  sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/' /etc/apache2/sites-enabled/*.conf 2>/dev/null || true
   systemctl disable apache2 2>/dev/null || true
   systemctl stop apache2 2>/dev/null || true
-  ok "Apache2 installed (disabled — activate via Panel \u2192 Web Server)"
+else
+  sub "Preventing Apache2 auto-start during install (Nginx owns port 80)..."
+  # policy-rc.d stops apt postinst from auto-starting services
+  printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+  chmod +x /usr/sbin/policy-rc.d
+  DEBIAN_FRONTEND=noninteractive apt-get install -y apache2 libapache2-mod-php libapache2-mod-fcgid 2>&1 | tee -a "$LOG" || warn "Apache2 install had warnings"
+  rm -f /usr/sbin/policy-rc.d
+  # Reconfigure Apache2 to port 8080 so it doesn't conflict with Nginx
+  sed -i 's/^Listen 80$/Listen 8080/' /etc/apache2/ports.conf 2>/dev/null || true
+  sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/' /etc/apache2/sites-enabled/*.conf 2>/dev/null || true
+  # Disable Apache2 — panel activates it via Web Server switcher
+  systemctl disable apache2 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  ok "Apache2 installed on port 8080 (disabled — activate via Panel → Web Server)"
 fi
 
 step "Installing PHP (all versions: 7.4, 8.0, 8.1, 8.2, 8.3)"
-sub "Checking if PHP 8.3 is already installed..."
-if is_cmd php8.3 && php8.3 -v > /dev/null 2>&1; then
-  ok "PHP 8.3 already installed: $(php8.3 -r 'echo phpversion();'  2>/dev/null)"
-else
-  sub "PHP 8.3 not found — installing..."
-fi
 PHP_VERSIONS="7.4 8.0 8.1 8.2 8.3"
 PHP_EXTS="fpm mysql pgsql curl gd mbstring xml zip bcmath intl soap opcache cli common sqlite3"
 if [ "$OS_FAMILY" = "debian" ]; then
-  if ! apt-cache show php8.3 > /dev/null 2>&1; then
-    sub "Adding ondrej/php repository (required for all PHP versions)..."
+  # ALWAYS add ondrej/php PPA — Ubuntu 24.04 default repos only have php8.3,
+  # NOT 7.4 / 8.0 / 8.1 / 8.2. Without this PPA those versions simply don't exist.
+  if ! grep -rq "ondrej/php\|sury.org/php" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    sub "Adding ondrej/php PPA (needed for ALL PHP versions 7.4–8.3)..."
     apt-get install -y software-properties-common >> "$LOG" 2>&1 || true
     add-apt-repository -y ppa:ondrej/php 2>&1 | tee -a "$LOG" || {
-      curl -sSL https://packages.sury.org/php/apt.gpg 2>/dev/null | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg 2>/dev/null || true
-      echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php.list
+      sub "PPA add-apt-repository failed — using sury.org fallback..."
+      curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg 2>/dev/null || true
+      echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php-sury.list
     }
     $PKG_UPDATE >> "$LOG" 2>&1
+    ok "ondrej/php PPA added — all PHP versions 7.4–8.3 now available"
+  else
+    ok "ondrej/php PPA already present — skipping add"
+    $PKG_UPDATE >> "$LOG" 2>&1 || true
   fi
   for VER in $PHP_VERSIONS; do
     if is_cmd "php${VER}" && "php${VER}" -v > /dev/null 2>&1; then
