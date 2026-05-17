@@ -114,7 +114,7 @@ cat << 'NEXABANNER'
 NEXABANNER
 printf '\033[0m'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.12\033[0m\n'
+printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.13\033[0m\n'
 printf '\033[38;5;208m  A Brand of \033[1;37mNexaroot Technology India Pvt Ltd\033[0m  \033[38;5;208m•  Powered By \033[1;37mHOSTGANGA.COM\033[0m\n'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\n'
@@ -252,6 +252,25 @@ case "${EDITION_CHOICE:-1}" in
 esac
 echo ""
 ok "Installing NexaPanel ${EDITION_NAME}"
+echo ""
+
+# Ask for email (needed for website license request)
+printf "[0;36m  ┌──────────────────────────────────────────────────────────────┐[0m\n"
+printf "[0;36m  │  Demo License Registration                                   │[0m\n"
+printf "[0;36m  │  Your email is required to generate a license from           │[0m\n"
+printf "[0;36m  │  nexapanel.hostganga.com (one free demo per server IP)       │[0m\n"
+printf "[0;36m  └──────────────────────────────────────────────────────────────┘[0m\n"
+echo ""
+DEMO_EMAIL=""
+while [ -z "$DEMO_EMAIL" ]; do
+  read -r -p "  Enter your email address: " DEMO_EMAIL
+  # Basic email validation
+  if ! echo "$DEMO_EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
+    echo -e "  [0;31m✗ Invalid email — please enter a valid address[0m"
+    DEMO_EMAIL=""
+  fi
+done
+ok "Email registered: ${DEMO_EMAIL}"
 echo ""
 
 # ════════════════════════════════════════════════════════════
@@ -1345,32 +1364,81 @@ if [ "$PANEL_READY" = "0" ]; then
     || fail "nexapanel service crashed — see logs above and fix before continuing"
 fi
 
-# Generate DEMO key locally + seed into PostgreSQL (no panel API needed — 100% reliable)
+# Request DEMO license from nexapanel.hostganga.com (same as website form)
 step "Activating trial license (${EDITION_NAME:-Web Edition})"
-sub "Generating DEMO key for ${SERVER_IP_NOW} (${EDITION_NAME:-Web Edition})..."
-DEMO_KEY=$(generate_demo_key "${SERVER_IP_NOW}")
-if [ -n "$DEMO_KEY" ]; then
-  sub "Seeding license into PostgreSQL (no panel API needed)..."
-  DEMO_EXPIRY=$(python3 -c "from datetime import datetime,timedelta; print((datetime.now()+timedelta(days=15)).strftime('%Y-%m-%d %H:%M:%S'))" 2>/dev/null \
+
+# Helper: seed a license key into PostgreSQL
+seed_license_to_db() {
+  local KEY="$1" PLAN="$2"
+  local EXPIRY
+  EXPIRY=$(python3 -c "from datetime import datetime,timedelta; print((datetime.now()+timedelta(days=15)).strftime('%Y-%m-%d %H:%M:%S'))" 2>/dev/null \
     || date -d "+15 days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "2099-01-01 00:00:00")
   PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel \
     -c "DELETE FROM panel_license;" >> "$LOG" 2>&1 || true
   PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel \
-    -c "INSERT INTO panel_license (license_key,server_ip,active,plan,expires_at,activated_at,updated_at) VALUES ('${DEMO_KEY}','${SERVER_IP_NOW}',true,'${PANEL_EDITION:-demo_web}','${DEMO_EXPIRY}',NOW(),NOW());" \
+    -c "INSERT INTO panel_license (license_key,server_ip,active,plan,expires_at,activated_at,updated_at) VALUES ('${KEY}','${SERVER_IP_NOW}',true,'${PLAN}','${EXPIRY}',NOW(),NOW());" \
     >> "$LOG" 2>&1
-  LIC_OK=$(PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -At \
+  local CHKR
+  CHKR=$(PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel -At \
     -c "SELECT active FROM panel_license LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
-  if [ "$LIC_OK" = "t" ]; then
-    ok "Trial license ACTIVATED: ${DEMO_KEY}"
-    ok "15-day trial started — Edition: ${EDITION_NAME:-Web Edition}"
-    ok "Upgrade at: nexapanel.hostganga.com"
+  [ "$CHKR" = "t" ]
+}
+
+sub "Requesting demo license from nexapanel.hostganga.com..."
+DEMO_KEY=""
+DEMO_PLAN="${PANEL_EDITION:-demo_web}"
+DEMO_REUSED=""
+
+# POST to demo.php JSON API (same logic as website form)
+API_RESP=$(curl -sf --max-time 30 \
+  -X POST "http://nexapanel.hostganga.com/demo.php?api=1" \
+  -H "X-NexaPanel-Installer: 1" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "edition=${PANEL_EDITION:-demo_web}" \
+  --data-urlencode "server_ip=${SERVER_IP_NOW}" \
+  --data-urlencode "hostname=${HOSTNAME:-}" \
+  --data-urlencode "email=${DEMO_EMAIL:-admin@${HOSTNAME:-server.local}}" \
+  2>>"$LOG") || true
+
+if [ -n "$API_RESP" ]; then
+  # Parse JSON: {"ok":true,"key":"DEMO-...","plan":"demo_web","reused":false}
+  API_OK=$(echo "$API_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('ok') else 'no')" 2>/dev/null || echo "no")
+  if [ "$API_OK" = "yes" ]; then
+    DEMO_KEY=$(echo "$API_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('key',''))" 2>/dev/null || echo "")
+    DEMO_PLAN=$(echo "$API_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('plan','demo_web'))" 2>/dev/null || echo "${PANEL_EDITION:-demo_web}")
+    DEMO_REUSED=$(echo "$API_RESP" | python3 -c "import sys,json; print('yes' if json.load(sys.stdin).get('reused') else 'no')" 2>/dev/null || echo "no")
+    sub "License received from nexapanel.hostganga.com"
   else
-    warn "License key generated but DB verify failed: ${DEMO_KEY}"
-    warn "Manual activate: Panel → License → Activate Key"
+    API_ERR=$(echo "$API_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','Unknown error'))" 2>/dev/null || echo "parse error")
+    warn "Website license request failed: ${API_ERR}"
+    warn "Falling back to local DEMO key generation..."
+    DEMO_KEY=$(generate_demo_key "${SERVER_IP_NOW}")
+    sub "Local DEMO key generated as fallback"
   fi
 else
-  warn "Could not generate DEMO key (Python3 missing?)"
-  warn "Activate manually at nexapanel.hostganga.com → Generate Trial"
+  warn "Could not reach nexapanel.hostganga.com — using local DEMO key..."
+  DEMO_KEY=$(generate_demo_key "${SERVER_IP_NOW}")
+  sub "Local DEMO key generated as fallback"
+fi
+
+# Seed license into PostgreSQL
+if [ -n "$DEMO_KEY" ]; then
+  sub "Activating license in database..."
+  if seed_license_to_db "$DEMO_KEY" "$DEMO_PLAN"; then
+    if [ "$DEMO_REUSED" = "yes" ]; then
+      ok "Existing trial license re-activated: ${DEMO_KEY}"
+    else
+      ok "Trial license ACTIVATED: ${DEMO_KEY}"
+    fi
+    ok "15-day trial started — Edition: ${EDITION_NAME:-Web Edition}"
+    ok "Manage license at: nexapanel.hostganga.com"
+  else
+    warn "License key generated but DB verify failed: ${DEMO_KEY}"
+    warn "Manual activate: Panel → License → Enter key above"
+  fi
+else
+  warn "Could not obtain a license key"
+  warn "Visit nexapanel.hostganga.com/demo.php to get one manually"
 fi
 
 # ════════════════════════════════════════════════════════════
