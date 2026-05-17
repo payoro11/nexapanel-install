@@ -50,7 +50,7 @@ cat << 'NEXABANNER'
 NEXABANNER
 printf '\033[0m'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.7\033[0m\n'
+printf '\033[1;37m  NexaPanel Installing...\033[0m  \033[0;36mAuto-Installer v2.8\033[0m\n'
 printf '\033[38;5;208m  A Brand of \033[1;37mNexaroot Technology India Pvt Ltd\033[0m  \033[38;5;208m•  Powered By \033[1;37mHOSTGANGA.COM\033[0m\n'
 printf '\033[38;5;208m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
 printf '\n'
@@ -275,6 +275,213 @@ else
     || warn "PostgreSQL still failing — run: curl -sSL https://nexapanel.hostganga.com/pg-fix.sh | sudo bash"
 fi
 
+
+# ════════════════════════════════════════════════════════════
+# PHASE 2 — Web Stack (installed BEFORE panel starts)
+# ════════════════════════════════════════════════════════════
+step "Installing Nginx"
+NGINX_OK=0
+$PKG_INSTALL nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
+if [ "$NGINX_OK" = "0" ]; then
+  warn "Nginx install failed — retrying with fix-broken..."
+  apt-get -f install -y >> "$LOG" 2>&1 || true
+  apt-get install -y --fix-missing nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
+fi
+if [ "$NGINX_OK" = "0" ]; then
+  warn "Apt nginx failed — trying snap nginx..."
+  snap install nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
+fi
+[ "$NGINX_OK" = "1" ] && ok "Nginx installed" || warn "Nginx install still failing — will configure manually"
+systemctl enable nginx >> "$LOG" 2>&1 || true
+systemctl start nginx >> "$LOG" 2>&1 || true
+
+step "Installing PHP 8.3 + extensions"
+if [ "$OS_FAMILY" = "debian" ]; then
+  if ! apt-cache show php8.3 > /dev/null 2>&1; then
+    info "Adding ondrej/php PPA for PHP 8.3..."
+    add-apt-repository -y ppa:ondrej/php >> "$LOG" 2>&1 || {
+      curl -sSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg >> "$LOG" 2>&1
+      echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php.list
+    }
+    $PKG_UPDATE >> "$LOG" 2>&1
+  fi
+  PHP_PKGS="php8.3 php8.3-fpm php8.3-mysql php8.3-pgsql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip php8.3-bcmath php8.3-intl php8.3-soap php8.3-opcache php8.3-cli php8.3-common php8.3-sqlite3"
+  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
+  systemctl enable --now php8.3-fpm >> "$LOG" 2>&1
+else
+  # RHEL family: use Remi repository for PHP 8.3
+  if [ "$MAJOR_VER" -ge 8 ]; then
+    $PKG_INSTALL https://rpms.remirepo.net/enterprise/remi-release-${MAJOR_VER}.rpm >> "$LOG" 2>&1 || true
+  fi
+  # Enable Remi PHP 8.3 module stream
+  $PKG_MGR module enable -y php:remi-8.3 >> "$LOG" 2>&1 || true
+  PHP_PKGS="php php-fpm php-mysqlnd php-pgsql php-curl php-gd php-mbstring php-xml php-zip php-bcmath php-intl php-soap php-opcache php-cli php-common"
+  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
+  systemctl enable --now php-fpm >> "$LOG" 2>&1
+  # On RHEL, www-data is www, set socket permissions
+  sed -i 's/^user = apache/user = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
+  sed -i 's/^group = apache/group = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
+  sed -i 's|^listen.owner = nobody|listen.owner = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
+  sed -i 's|^listen.group = nobody|listen.group = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
+fi
+ok "PHP 8.3 + extensions installed"
+
+step "Installing MariaDB"
+# Wait for any apt lock to clear (other processes may be updating)
+_LOCK_WAIT=0
+while fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1 || fuser /var/lib/apt/lists/lock > /dev/null 2>&1; do
+  _LOCK_WAIT=$((_LOCK_WAIT+1))
+  [ "$_LOCK_WAIT" -gt 30 ] && break
+  info "Waiting for apt lock... (${_LOCK_WAIT}s)"
+  sleep 2
+done
+
+MARIADB_OK=0
+# Attempt 1: default repo
+$PKG_INSTALL mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
+
+# Attempt 2: add official MariaDB repo
+if [ "$MARIADB_OK" = "0" ] && [ "$OS_FAMILY" = "debian" ]; then
+  warn "Default MariaDB failed — adding official MariaDB 10.11 repo..."
+  apt-get install -y apt-transport-https curl gnupg >> "$LOG" 2>&1 || true
+  curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup     | bash -s -- --mariadb-server-version="mariadb-10.11" >> "$LOG" 2>&1 || true
+  apt-get update -qq >> "$LOG" 2>&1 || true
+  apt-get install -y mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
+fi
+
+# Attempt 3: fix-broken
+if [ "$MARIADB_OK" = "0" ]; then
+  warn "Retrying with apt fix-broken..."
+  apt-get -f install -y >> "$LOG" 2>&1 || true
+  apt-get install -y --fix-missing mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
+fi
+
+[ "$MARIADB_OK" = "1" ] && ok "MariaDB installed" || warn "MariaDB package install had issues — trying to start anyway"
+systemctl enable mariadb >> "$LOG" 2>&1 || true
+systemctl start mariadb  >> "$LOG" 2>&1 || true
+sleep 4
+
+# Secure MariaDB — try unix_socket first (default on fresh install), then password
+MYSQL_CMD=""
+if mariadb -u root -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
+  MYSQL_CMD="mariadb -u root"
+elif mysql -u root -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
+  MYSQL_CMD="mysql -u root"
+fi
+
+if [ -n "$MYSQL_CMD" ]; then
+  $MYSQL_CMD >> "$LOG" 2>&1 << MYSQLEOF
+UPDATE mysql.global_priv SET priv=json_set(priv,'$.plugin','mysql_native_password','$.authentication_string',PASSWORD('${DB_PASS}')) WHERE User='root' AND Host='localhost';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
+DROP DATABASE IF EXISTS test;
+CREATE DATABASE IF NOT EXISTS nexapanel_apps CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+FLUSH PRIVILEGES;
+MYSQLEOF
+  ok "MariaDB secured ✓"
+else
+  warn "Could not connect to MariaDB via socket — trying password auth..."
+  mysql -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1     && ok "MariaDB already secured ✓"     || warn "MariaDB secure step skipped — run: mysql_secure_installation"
+fi
+
+# Write .my.cnf for root convenience
+printf "[client]
+password=%s
+" "${DB_PASS}" > /root/.my.cnf
+chmod 600 /root/.my.cnf
+
+systemctl restart mariadb >> "$LOG" 2>&1 || true; sleep 2
+ok "MariaDB installed and secured"
+
+# Verify connectivity
+if mysql -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null    || mariadb -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
+  ok "MariaDB root login verified ✓"
+  PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel     -c "INSERT INTO settings (key, value) VALUES ('mysql_root_password', '${DB_PASS}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();"     >> "$LOG" 2>&1 && ok "MariaDB password confirmed in panel DB ✓" || warn "Password re-seed failed"
+else
+  warn "MariaDB root login check failed — password is in /root/.my.cnf"
+fi
+
+step "Installing Redis"
+REDIS_OK=0
+if [ "$OS_FAMILY" = "debian" ]; then
+  $PKG_INSTALL redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
+  if [ "$REDIS_OK" = "0" ]; then
+    apt-get -f install -y >> "$LOG" 2>&1 || true
+    apt-get install -y --fix-missing redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
+  fi
+else
+  $PKG_INSTALL redis >> "$LOG" 2>&1 && REDIS_OK=1 || true
+  if [ "$REDIS_OK" = "0" ]; then
+    $PKG_INSTALL redis6 redis7 >> "$LOG" 2>&1 && REDIS_OK=1 || true
+  fi
+fi
+if [ "$REDIS_OK" = "1" ]; then
+  systemctl enable --now "$REDIS_SVC" >> "$LOG" 2>&1 && ok "Redis installed and started ✓" || warn "Redis installed but start failed"
+else
+  warn "Redis install failed — panel works without Redis (optional cache)"
+fi
+
+step "Installing Certbot"
+if [ "$OS_FAMILY" = "debian" ]; then
+  $PKG_INSTALL certbot python3-certbot-nginx >> "$LOG" 2>&1 && ok "Certbot installed" || warn "Certbot install failed"
+else
+  # RHEL: Certbot via snap or EPEL
+  if command -v snap > /dev/null 2>&1; then
+    snap install --classic certbot >> "$LOG" 2>&1 && ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null && ok "Certbot installed via snap"
+  else
+    $PKG_INSTALL certbot python3-certbot-nginx >> "$LOG" 2>&1 && ok "Certbot installed" || warn "Certbot install failed — install manually after setup"
+  fi
+fi
+
+step "Configuring Firewall ($FIREWALL_TYPE)"
+if [ "$FIREWALL_TYPE" = "ufw" ]; then
+  $PKG_INSTALL ufw >> "$LOG" 2>&1
+  ufw --force reset >> "$LOG" 2>&1
+  ufw default deny incoming >> "$LOG" 2>&1
+  ufw default allow outgoing >> "$LOG" 2>&1
+  ufw allow 22/tcp comment 'SSH' >> "$LOG" 2>&1
+  ufw allow 80/tcp comment 'HTTP' >> "$LOG" 2>&1
+  ufw allow 443/tcp comment 'HTTPS' >> "$LOG" 2>&1
+  ufw allow ${PANEL_PORT}/tcp comment 'NexaPanel' >> "$LOG" 2>&1
+  echo "y" | ufw enable >> "$LOG" 2>&1
+  ok "UFW configured (ports 22, 80, 443, ${PANEL_PORT} open)"
+else
+  # firewalld on RHEL
+  $PKG_INSTALL firewalld >> "$LOG" 2>&1
+  systemctl enable --now firewalld >> "$LOG" 2>&1
+  firewall-cmd --permanent --add-service=ssh >> "$LOG" 2>&1
+  firewall-cmd --permanent --add-service=http >> "$LOG" 2>&1
+  firewall-cmd --permanent --add-service=https >> "$LOG" 2>&1
+  firewall-cmd --permanent --add-port=${PANEL_PORT}/tcp >> "$LOG" 2>&1
+  firewall-cmd --reload >> "$LOG" 2>&1
+  ok "firewalld configured (SSH, HTTP, HTTPS, port ${PANEL_PORT} open)"
+fi
+
+step "Installing Fail2ban"
+if [ "$NEEDS_EPEL" = "1" ]; then
+  $PKG_MGR install -y epel-release >> "$LOG" 2>&1 || true
+fi
+$PKG_INSTALL fail2ban >> "$LOG" 2>&1
+mkdir -p /etc/fail2ban
+cat > /etc/fail2ban/jail.local << 'F2B'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+[sshd]
+enabled = true
+port    = ssh
+logpath = %(sshd_log)s
+backend = %(syslog_backend)s
+[nginx-http-auth]
+enabled = true
+F2B
+systemctl enable --now fail2ban >> "$LOG" 2>&1 && ok "Fail2ban configured"
+
+
+# ════════════════════════════════════════════════════════════
+# PHASE 3 — NexaPanel Download, Config, Database
+# ════════════════════════════════════════════════════════════
 # ── NexaPanel Source ──────────────────────────────────────
 step "Downloading NexaPanel"
 useradd -r -m -d "$PANEL_DIR" -s /bin/bash "$PANEL_USER" 2>/dev/null || true
@@ -650,394 +857,9 @@ ok "Server IP detected: ${SERVER_IP_NOW}"
 # PHASE 2 — START PANEL SERVICE
 #           Panel starts NOW (PostgreSQL + passwords ready)
 # ════════════════════════════════════════════════════════════
-step "Starting NexaPanel service"
-cat > /etc/systemd/system/nexapanel.service << SERVICE
-[Unit]
-Description=NexaPanel Control Panel
-After=network.target postgresql.service
-Wants=postgresql.service
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=${PANEL_DIR}/artifacts/api-server
-EnvironmentFile=${PANEL_DIR}/artifacts/api-server/.env
-ExecStart=${NODE_BIN} dist/index.mjs
-Restart=on-failure
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=nexapanel
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-systemctl daemon-reload >> "$LOG" 2>&1
-systemctl enable nexapanel >> "$LOG" 2>&1
-systemctl start nexapanel >> "$LOG" 2>&1
-
-# Wait for panel to be ready (up to 30s)
-PANEL_READY=0
-for i in $(seq 1 10); do
-  sleep 3
-  if curl -sf --connect-timeout 3 "http://127.0.0.1:${PANEL_PORT}/api/healthz" > /dev/null 2>&1; then
-    ok "NexaPanel API is responding ✓ (took $((i*3))s)"
-    PANEL_READY=1
-    break
-  fi
-done
-if [ "$PANEL_READY" = "0" ]; then
-  warn "Panel not responding yet — checking service status..."
-  systemctl is-active --quiet nexapanel && info "Service is running (may need more time)" || {
-    journalctl -u nexapanel -n 20 --no-pager | tee -a "$LOG"
-  }
-fi
-
-# Auto-request trial license from hostganga.com (via Node.js API on nexapanel.hostganga.com)
-step "Requesting trial license from hostganga.com..."
-DEMO_RESP=$(curl -s --connect-timeout 15 --max-time 30   -X POST https://nexapanel.hostganga.com/api/panel/license/public/generate   -H "Content-Type: application/json"   -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web","hostname":"$(hostname)","os":"${OS_FAMILY:-linux}"}"   2>/dev/null || echo '{}')
-DEMO_KEY=$(echo "$DEMO_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
-if [ -n "$DEMO_KEY" ]; then
-  # Retry activation up to 5 times (panel may still be warming up)
-  ACT_OK=""
-  for _try in 1 2 3 4 5; do
-    sleep 4
-    # Step 1: get admin token
-    ADMIN_TOKEN=$(curl -s --connect-timeout 8 --max-time 12       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/auth/login"       -H "Content-Type: application/json"       -d '{"email":"admin@example.com","password":"admin123"}'       2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
-    [ -z "$ADMIN_TOKEN" ] && continue
-    # Step 2: activate with auth header + serverIp
-    ACT_RESP=$(curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license"       -H "Content-Type: application/json"       -H "Authorization: Bearer ${ADMIN_TOKEN}"       -d "{"licenseKey":"${DEMO_KEY}","serverIp":"${SERVER_IP_NOW}"}" 2>/dev/null || echo '{}')
-    ACT_OK=$(echo "$ACT_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('active') else '')" 2>/dev/null || echo "")
-    [ "$ACT_OK" = "ok" ] && break
-  done
-  if [ "$ACT_OK" = "ok" ]; then
-    ok "Trial license activated: ${DEMO_KEY}"
-    ok "15-day trial started — upgrade at nexapanel.hostganga.com"
-  else
-    warn "Auto-activation failed — key saved: ${DEMO_KEY}"
-    warn "Enter key manually: Panel → License → Activate License Key"
-  fi
-else
-  # Fallback: try local public/generate endpoint directly
-  DEMO_RESP2=$(curl -s --connect-timeout 8 --max-time 15     -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/generate"     -H "Content-Type: application/json"     -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web"}"     2>/dev/null || echo '{}')
-  DEMO_KEY2=$(echo "$DEMO_RESP2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
-  if [ -n "$DEMO_KEY2" ]; then
-    # Activate via public endpoint (no auth needed)
-    curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/activate"       -H "Content-Type: application/json"       -d "{"license_key":"${DEMO_KEY2}","server_ip":"${SERVER_IP_NOW}"}" > /dev/null 2>&1
-    ok "Trial license activated (local): ${DEMO_KEY2}"
-  else
-    warn "Could not get trial license — activate manually at nexapanel.hostganga.com"
-  fi
-fi
 
 # ════════════════════════════════════════════════════════════
-# PHASE 3 — PHP STACK (MariaDB, PHP 8.3, Nginx, Redis)
-#           Now that panel is up, install the web server stack
-# ════════════════════════════════════════════════════════════
-step "Installing Nginx"
-NGINX_OK=0
-$PKG_INSTALL nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
-if [ "$NGINX_OK" = "0" ]; then
-  warn "Nginx install failed — retrying with fix-broken..."
-  apt-get -f install -y >> "$LOG" 2>&1 || true
-  apt-get install -y --fix-missing nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
-fi
-if [ "$NGINX_OK" = "0" ]; then
-  warn "Apt nginx failed — trying snap nginx..."
-  snap install nginx >> "$LOG" 2>&1 && NGINX_OK=1 || true
-fi
-[ "$NGINX_OK" = "1" ] && ok "Nginx installed" || warn "Nginx install still failing — will configure manually"
-systemctl enable nginx >> "$LOG" 2>&1 || true
-systemctl start nginx >> "$LOG" 2>&1 || true
-
-step "Installing PHP 8.3 + extensions"
-if [ "$OS_FAMILY" = "debian" ]; then
-  if ! apt-cache show php8.3 > /dev/null 2>&1; then
-    info "Adding ondrej/php PPA for PHP 8.3..."
-    add-apt-repository -y ppa:ondrej/php >> "$LOG" 2>&1 || {
-      curl -sSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/php.gpg >> "$LOG" 2>&1
-      echo "deb https://packages.sury.org/php/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/php.list
-    }
-    $PKG_UPDATE >> "$LOG" 2>&1
-  fi
-  PHP_PKGS="php8.3 php8.3-fpm php8.3-mysql php8.3-pgsql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-zip php8.3-bcmath php8.3-intl php8.3-soap php8.3-opcache php8.3-cli php8.3-common php8.3-sqlite3"
-  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
-  systemctl enable --now php8.3-fpm >> "$LOG" 2>&1
-else
-  # RHEL family: use Remi repository for PHP 8.3
-  if [ "$MAJOR_VER" -ge 8 ]; then
-    $PKG_INSTALL https://rpms.remirepo.net/enterprise/remi-release-${MAJOR_VER}.rpm >> "$LOG" 2>&1 || true
-  fi
-  # Enable Remi PHP 8.3 module stream
-  $PKG_MGR module enable -y php:remi-8.3 >> "$LOG" 2>&1 || true
-  PHP_PKGS="php php-fpm php-mysqlnd php-pgsql php-curl php-gd php-mbstring php-xml php-zip php-bcmath php-intl php-soap php-opcache php-cli php-common"
-  $PKG_INSTALL $PHP_PKGS >> "$LOG" 2>&1 || warn "Some PHP extensions may not be available"
-  systemctl enable --now php-fpm >> "$LOG" 2>&1
-  # On RHEL, www-data is www, set socket permissions
-  sed -i 's/^user = apache/user = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
-  sed -i 's/^group = apache/group = nginx/' /etc/php-fpm.d/www.conf 2>/dev/null || true
-  sed -i 's|^listen.owner = nobody|listen.owner = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
-  sed -i 's|^listen.group = nobody|listen.group = nginx|' /etc/php-fpm.d/www.conf 2>/dev/null || true
-fi
-ok "PHP 8.3 + extensions installed"
-
-step "Installing MariaDB"
-# Wait for any apt lock to clear (other processes may be updating)
-_LOCK_WAIT=0
-while fuser /var/lib/dpkg/lock-frontend > /dev/null 2>&1 || fuser /var/lib/apt/lists/lock > /dev/null 2>&1; do
-  _LOCK_WAIT=$((_LOCK_WAIT+1))
-  [ "$_LOCK_WAIT" -gt 30 ] && break
-  info "Waiting for apt lock... (${_LOCK_WAIT}s)"
-  sleep 2
-done
-
-MARIADB_OK=0
-# Attempt 1: default repo
-$PKG_INSTALL mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
-
-# Attempt 2: add official MariaDB repo
-if [ "$MARIADB_OK" = "0" ] && [ "$OS_FAMILY" = "debian" ]; then
-  warn "Default MariaDB failed — adding official MariaDB 10.11 repo..."
-  apt-get install -y apt-transport-https curl gnupg >> "$LOG" 2>&1 || true
-  curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup     | bash -s -- --mariadb-server-version="mariadb-10.11" >> "$LOG" 2>&1 || true
-  apt-get update -qq >> "$LOG" 2>&1 || true
-  apt-get install -y mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
-fi
-
-# Attempt 3: fix-broken
-if [ "$MARIADB_OK" = "0" ]; then
-  warn "Retrying with apt fix-broken..."
-  apt-get -f install -y >> "$LOG" 2>&1 || true
-  apt-get install -y --fix-missing mariadb-server >> "$LOG" 2>&1 && MARIADB_OK=1 || true
-fi
-
-[ "$MARIADB_OK" = "1" ] && ok "MariaDB installed" || warn "MariaDB package install had issues — trying to start anyway"
-systemctl enable mariadb >> "$LOG" 2>&1 || true
-systemctl start mariadb  >> "$LOG" 2>&1 || true
-sleep 4
-
-# Secure MariaDB — try unix_socket first (default on fresh install), then password
-MYSQL_CMD=""
-if mariadb -u root -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
-  MYSQL_CMD="mariadb -u root"
-elif mysql -u root -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
-  MYSQL_CMD="mysql -u root"
-fi
-
-if [ -n "$MYSQL_CMD" ]; then
-  $MYSQL_CMD >> "$LOG" 2>&1 << MYSQLEOF
-UPDATE mysql.global_priv SET priv=json_set(priv,'$.plugin','mysql_native_password','$.authentication_string',PASSWORD('${DB_PASS}')) WHERE User='root' AND Host='localhost';
-DELETE FROM mysql.user WHERE User='';
-DELETE FROM mysql.global_priv WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
-DROP DATABASE IF EXISTS test;
-CREATE DATABASE IF NOT EXISTS nexapanel_apps CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-FLUSH PRIVILEGES;
-MYSQLEOF
-  ok "MariaDB secured ✓"
-else
-  warn "Could not connect to MariaDB via socket — trying password auth..."
-  mysql -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1     && ok "MariaDB already secured ✓"     || warn "MariaDB secure step skipped — run: mysql_secure_installation"
-fi
-
-# Write .my.cnf for root convenience
-printf "[client]
-password=%s
-" "${DB_PASS}" > /root/.my.cnf
-chmod 600 /root/.my.cnf
-
-systemctl restart mariadb >> "$LOG" 2>&1 || true; sleep 2
-ok "MariaDB installed and secured"
-
-# Verify connectivity
-if mysql -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null    || mariadb -u root -p"${DB_PASS}" -e "SELECT 1;" >> "$LOG" 2>&1 2>/dev/null; then
-  ok "MariaDB root login verified ✓"
-  PGPASSWORD="${PANEL_DB_PASS}" psql -h 127.0.0.1 -U nexapanel -d nexapanel     -c "INSERT INTO settings (key, value) VALUES ('mysql_root_password', '${DB_PASS}') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();"     >> "$LOG" 2>&1 && ok "MariaDB password confirmed in panel DB ✓" || warn "Password re-seed failed"
-else
-  warn "MariaDB root login check failed — password is in /root/.my.cnf"
-fi
-
-step "Installing Redis"
-REDIS_OK=0
-if [ "$OS_FAMILY" = "debian" ]; then
-  $PKG_INSTALL redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
-  if [ "$REDIS_OK" = "0" ]; then
-    apt-get -f install -y >> "$LOG" 2>&1 || true
-    apt-get install -y --fix-missing redis-server >> "$LOG" 2>&1 && REDIS_OK=1 || true
-  fi
-else
-  $PKG_INSTALL redis >> "$LOG" 2>&1 && REDIS_OK=1 || true
-  if [ "$REDIS_OK" = "0" ]; then
-    $PKG_INSTALL redis6 redis7 >> "$LOG" 2>&1 && REDIS_OK=1 || true
-  fi
-fi
-if [ "$REDIS_OK" = "1" ]; then
-  systemctl enable --now "$REDIS_SVC" >> "$LOG" 2>&1 && ok "Redis installed and started ✓" || warn "Redis installed but start failed"
-else
-  warn "Redis install failed — panel works without Redis (optional cache)"
-fi
-
-# ════════════════════════════════════════════════════════════
-# PHASE 4 — phpMyAdmin, Certbot, UFW, Fail2ban
-# ════════════════════════════════════════════════════════════
-step "Installing phpMyAdmin"
-PMA_VERSION="5.2.1"
-PMA_URL="https://files.phpmyadmin.net/phpMyAdmin/${PMA_VERSION}/phpMyAdmin-${PMA_VERSION}-all-languages.tar.gz"
-mkdir -p "$PMA_DIR"
-if curl -sSL "$PMA_URL" | tar -xz -C "$PMA_DIR" --strip-components=1 >> "$LOG" 2>&1; then
-  cp "$PMA_DIR/config.sample.inc.php" "$PMA_DIR/config.inc.php"
-  BLOWFISH=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*' | head -c 32)
-  sed -i "s/\$cfg\['blowfish_secret'\] = ''/\$cfg['blowfish_secret'] = '${BLOWFISH}'/" "$PMA_DIR/config.inc.php"
-  printf "\$cfg['Servers'][\$i]['auth_type'] = 'signon';
-\$cfg['Servers'][\$i]['SignonSession'] = 'SignonSession';
-\$cfg['Servers'][\$i]['SignonURL'] = '/nexa-signon.php';
-\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
-" >> "$PMA_DIR/config.inc.php"
-  chown -R www-data:www-data "$PMA_DIR"; chmod -R 755 "$PMA_DIR"
-  ok "phpMyAdmin installed with signon auth"
-else
-  warn "phpMyAdmin download failed — install manually: apt install phpmyadmin -y"
-fi
-
-step "Creating phpMyAdmin auto-login bridge script"
-mkdir -p /var/www/html
-cat > /var/www/html/nexa-signon.php << 'SIGNONPHP'
-<?php
-// NexaPanel phpMyAdmin Auto-Login Bridge v2
-// Reads panel port dynamically from /opt/nexapanel/.env
-$token = $_GET['token'] ?? '';
-$db    = $_GET['db']    ?? '';
-
-if (empty($token)) {
-    http_response_code(400);
-    echo '<p style="font-family:sans-serif;color:red">No token provided. Please try again from NexaPanel.</p>';
-    exit;
-}
-
-// Read panel port from .env (fallback 8080)
-$port = 8080;
-$envFile = '/opt/nexapanel/.env';
-if (file_exists($envFile)) {
-    foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
-        if (preg_match('/^PORT=(d+)/', $line, $m)) { $port = (int)$m[1]; break; }
-    }
-}
-
-// Fetch credentials from panel API directly (localhost, no nginx, no auth)
-$url = 'http://127.0.0.1:' . $port . '/api/panel/databases/signon/' . rawurlencode($token);
-$ch  = curl_init($url);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT        => 8,
-    CURLOPT_CONNECTTIMEOUT => 5,
-    CURLOPT_FOLLOWLOCATION => false,
-]);
-$response = curl_exec($ch);
-$httpCode  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$curlError = curl_error($ch);
-curl_close($ch);
-
-if ($curlError || $httpCode !== 200 || !$response) {
-    http_response_code(502);
-    echo '<div style="font-family:sans-serif;padding:20px">';
-    echo '<h3 style="color:red">phpMyAdmin Auto-Login Failed</h3>';
-    if ($curlError) echo '<p>Connection error: ' . htmlspecialchars($curlError) . '</p>';
-    elseif ($httpCode === 404) echo '<p>Token expired or already used — please click the Auto-Login button again.</p>';
-    else echo '<p>Panel API returned HTTP ' . $httpCode . ' on port ' . $port . '.</p>';
-    echo '<p><a href="javascript:window.close()">Close this tab</a> and click the phpMyAdmin button again in NexaPanel.</p>';
-    echo '</div>';
-    exit;
-}
-
-$data = json_decode($response, true);
-if (!$data || empty($data['username'])) {
-    http_response_code(500);
-    echo '<p style="font-family:sans-serif;color:red">Credential decode error. Contact your administrator.</p>';
-    exit;
-}
-
-// Destroy any existing SignonSession first to avoid stale credential conflicts
-session_name('SignonSession');
-if (session_status() === PHP_SESSION_NONE) session_start();
-session_destroy();
-
-// Start fresh and write new credentials
-session_name('SignonSession');
-session_start();
-$_SESSION['PMA_single_signon_user']     = $data['username'];
-$_SESSION['PMA_single_signon_password'] = $data['password'];
-$_SESSION['PMA_single_signon_host']     = '127.0.0.1';
-$_SESSION['PMA_single_signon_port']     = '3306';
-session_write_close();
-
-$targetDb = !empty($db) ? $db : ($data['db'] ?? '');
-$redirect = '/phpmyadmin/' . ($targetDb ? '?db=' . rawurlencode($targetDb) : '');
-header('Location: ' . $redirect);
-exit;
-SIGNONPHP
-chown www-data:www-data /var/www/html/nexa-signon.php
-chmod 644 /var/www/html/nexa-signon.php
-ok "nexa-signon.php created"
-
-step "Installing Certbot"
-if [ "$OS_FAMILY" = "debian" ]; then
-  $PKG_INSTALL certbot python3-certbot-nginx >> "$LOG" 2>&1 && ok "Certbot installed" || warn "Certbot install failed"
-else
-  # RHEL: Certbot via snap or EPEL
-  if command -v snap > /dev/null 2>&1; then
-    snap install --classic certbot >> "$LOG" 2>&1 && ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null && ok "Certbot installed via snap"
-  else
-    $PKG_INSTALL certbot python3-certbot-nginx >> "$LOG" 2>&1 && ok "Certbot installed" || warn "Certbot install failed — install manually after setup"
-  fi
-fi
-
-step "Configuring Firewall ($FIREWALL_TYPE)"
-if [ "$FIREWALL_TYPE" = "ufw" ]; then
-  $PKG_INSTALL ufw >> "$LOG" 2>&1
-  ufw --force reset >> "$LOG" 2>&1
-  ufw default deny incoming >> "$LOG" 2>&1
-  ufw default allow outgoing >> "$LOG" 2>&1
-  ufw allow 22/tcp comment 'SSH' >> "$LOG" 2>&1
-  ufw allow 80/tcp comment 'HTTP' >> "$LOG" 2>&1
-  ufw allow 443/tcp comment 'HTTPS' >> "$LOG" 2>&1
-  ufw allow ${PANEL_PORT}/tcp comment 'NexaPanel' >> "$LOG" 2>&1
-  echo "y" | ufw enable >> "$LOG" 2>&1
-  ok "UFW configured (ports 22, 80, 443, ${PANEL_PORT} open)"
-else
-  # firewalld on RHEL
-  $PKG_INSTALL firewalld >> "$LOG" 2>&1
-  systemctl enable --now firewalld >> "$LOG" 2>&1
-  firewall-cmd --permanent --add-service=ssh >> "$LOG" 2>&1
-  firewall-cmd --permanent --add-service=http >> "$LOG" 2>&1
-  firewall-cmd --permanent --add-service=https >> "$LOG" 2>&1
-  firewall-cmd --permanent --add-port=${PANEL_PORT}/tcp >> "$LOG" 2>&1
-  firewall-cmd --reload >> "$LOG" 2>&1
-  ok "firewalld configured (SSH, HTTP, HTTPS, port ${PANEL_PORT} open)"
-fi
-
-step "Installing Fail2ban"
-if [ "$NEEDS_EPEL" = "1" ]; then
-  $PKG_MGR install -y epel-release >> "$LOG" 2>&1 || true
-fi
-$PKG_INSTALL fail2ban >> "$LOG" 2>&1
-mkdir -p /etc/fail2ban
-cat > /etc/fail2ban/jail.local << 'F2B'
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-[sshd]
-enabled = true
-port    = ssh
-logpath = %(sshd_log)s
-backend = %(syslog_backend)s
-[nginx-http-auth]
-enabled = true
-F2B
-systemctl enable --now fail2ban >> "$LOG" 2>&1 && ok "Fail2ban configured"
-
-# ════════════════════════════════════════════════════════════
-# PHASE 5 — NGINX CONFIG + FILE PERMISSIONS
+# PHASE 4 — Nginx Config (before panel start)
 # ════════════════════════════════════════════════════════════
 step "Configuring Nginx reverse proxy"
 SERVER_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
@@ -1143,6 +965,193 @@ if nginx -t >> "$LOG" 2>&1; then
 else
   warn "Nginx config test failed — check: nginx -t"
 fi
+
+
+# ════════════════════════════════════════════════════════════
+# PHASE 5 — Start Panel Service + License
+# ════════════════════════════════════════════════════════════
+step "Starting NexaPanel service"
+cat > /etc/systemd/system/nexapanel.service << SERVICE
+[Unit]
+Description=NexaPanel Control Panel
+After=network.target postgresql.service mariadb.service
+Wants=postgresql.service mariadb.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${PANEL_DIR}/artifacts/api-server
+EnvironmentFile=${PANEL_DIR}/artifacts/api-server/.env
+ExecStart=${NODE_BIN} dist/index.mjs
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexapanel
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload >> "$LOG" 2>&1
+systemctl enable nexapanel >> "$LOG" 2>&1
+systemctl start nexapanel >> "$LOG" 2>&1
+
+# Wait for panel to be ready (up to 30s)
+PANEL_READY=0
+for i in $(seq 1 10); do
+  sleep 3
+  if curl -sf --connect-timeout 3 "http://127.0.0.1:${PANEL_PORT}/api/healthz" > /dev/null 2>&1; then
+    ok "NexaPanel API is responding ✓ (took $((i*3))s)"
+    PANEL_READY=1
+    break
+  fi
+done
+if [ "$PANEL_READY" = "0" ]; then
+  warn "Panel not responding yet — checking service status..."
+  systemctl is-active --quiet nexapanel && info "Service is running (may need more time)" || {
+    journalctl -u nexapanel -n 20 --no-pager | tee -a "$LOG"
+  }
+fi
+
+# Auto-request trial license from hostganga.com (via Node.js API on nexapanel.hostganga.com)
+step "Requesting trial license from hostganga.com..."
+DEMO_RESP=$(curl -s --connect-timeout 15 --max-time 30   -X POST https://nexapanel.hostganga.com/api/panel/license/public/generate   -H "Content-Type: application/json"   -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web","hostname":"$(hostname)","os":"${OS_FAMILY:-linux}"}"   2>/dev/null || echo '{}')
+DEMO_KEY=$(echo "$DEMO_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
+if [ -n "$DEMO_KEY" ]; then
+  # Retry activation up to 5 times (panel may still be warming up)
+  ACT_OK=""
+  for _try in 1 2 3 4 5; do
+    sleep 4
+    # Step 1: get admin token
+    ADMIN_TOKEN=$(curl -s --connect-timeout 8 --max-time 12       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/auth/login"       -H "Content-Type: application/json"       -d '{"email":"admin@example.com","password":"admin123"}'       2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+    [ -z "$ADMIN_TOKEN" ] && continue
+    # Step 2: activate with auth header + serverIp
+    ACT_RESP=$(curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license"       -H "Content-Type: application/json"       -H "Authorization: Bearer ${ADMIN_TOKEN}"       -d "{"licenseKey":"${DEMO_KEY}","serverIp":"${SERVER_IP_NOW}"}" 2>/dev/null || echo '{}')
+    ACT_OK=$(echo "$ACT_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('active') else '')" 2>/dev/null || echo "")
+    [ "$ACT_OK" = "ok" ] && break
+  done
+  if [ "$ACT_OK" = "ok" ]; then
+    ok "Trial license activated: ${DEMO_KEY}"
+    ok "15-day trial started — upgrade at nexapanel.hostganga.com"
+  else
+    warn "Auto-activation failed — key saved: ${DEMO_KEY}"
+    warn "Enter key manually: Panel → License → Activate License Key"
+  fi
+else
+  # Fallback: try local public/generate endpoint directly
+  DEMO_RESP2=$(curl -s --connect-timeout 8 --max-time 15     -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/generate"     -H "Content-Type: application/json"     -d "{"server_ip":"${SERVER_IP_NOW}","edition":"demo_web"}"     2>/dev/null || echo '{}')
+  DEMO_KEY2=$(echo "$DEMO_RESP2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('license_key',''))" 2>/dev/null || echo "")
+  if [ -n "$DEMO_KEY2" ]; then
+    # Activate via public endpoint (no auth needed)
+    curl -s --connect-timeout 10 --max-time 20       -X POST "http://127.0.0.1:${PANEL_PORT}/api/panel/license/public/activate"       -H "Content-Type: application/json"       -d "{"license_key":"${DEMO_KEY2}","server_ip":"${SERVER_IP_NOW}"}" > /dev/null 2>&1
+    ok "Trial license activated (local): ${DEMO_KEY2}"
+  else
+    warn "Could not get trial license — activate manually at nexapanel.hostganga.com"
+  fi
+fi
+
+# ════════════════════════════════════════════════════════════
+# PHASE 6 — phpMyAdmin
+# ════════════════════════════════════════════════════════════
+step "Installing phpMyAdmin"
+PMA_VERSION="5.2.1"
+PMA_URL="https://files.phpmyadmin.net/phpMyAdmin/${PMA_VERSION}/phpMyAdmin-${PMA_VERSION}-all-languages.tar.gz"
+mkdir -p "$PMA_DIR"
+if curl -sSL "$PMA_URL" | tar -xz -C "$PMA_DIR" --strip-components=1 >> "$LOG" 2>&1; then
+  cp "$PMA_DIR/config.sample.inc.php" "$PMA_DIR/config.inc.php"
+  BLOWFISH=$(openssl rand -base64 32 | tr -dc 'a-zA-Z0-9!@#$%^&*' | head -c 32)
+  sed -i "s/\$cfg\['blowfish_secret'\] = ''/\$cfg['blowfish_secret'] = '${BLOWFISH}'/" "$PMA_DIR/config.inc.php"
+  printf "\$cfg['Servers'][\$i]['auth_type'] = 'signon';
+\$cfg['Servers'][\$i]['SignonSession'] = 'SignonSession';
+\$cfg['Servers'][\$i]['SignonURL'] = '/nexa-signon.php';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+" >> "$PMA_DIR/config.inc.php"
+  chown -R www-data:www-data "$PMA_DIR"; chmod -R 755 "$PMA_DIR"
+  ok "phpMyAdmin installed with signon auth"
+else
+  warn "phpMyAdmin download failed — install manually: apt install phpmyadmin -y"
+fi
+
+step "Creating phpMyAdmin auto-login bridge script"
+mkdir -p /var/www/html
+cat > /var/www/html/nexa-signon.php << 'SIGNONPHP'
+<?php
+// NexaPanel phpMyAdmin Auto-Login Bridge v2
+// Reads panel port dynamically from /opt/nexapanel/.env
+$token = $_GET['token'] ?? '';
+$db    = $_GET['db']    ?? '';
+
+if (empty($token)) {
+    http_response_code(400);
+    echo '<p style="font-family:sans-serif;color:red">No token provided. Please try again from NexaPanel.</p>';
+    exit;
+}
+
+// Read panel port from .env (fallback 8080)
+$port = 8080;
+$envFile = '/opt/nexapanel/.env';
+if (file_exists($envFile)) {
+    foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        if (preg_match('/^PORT=(d+)/', $line, $m)) { $port = (int)$m[1]; break; }
+    }
+}
+
+// Fetch credentials from panel API directly (localhost, no nginx, no auth)
+$url = 'http://127.0.0.1:' . $port . '/api/panel/databases/signon/' . rawurlencode($token);
+$ch  = curl_init($url);
+curl_setopt_array($ch, [
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_TIMEOUT        => 8,
+    CURLOPT_CONNECTTIMEOUT => 5,
+    CURLOPT_FOLLOWLOCATION => false,
+]);
+$response = curl_exec($ch);
+$httpCode  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$curlError = curl_error($ch);
+curl_close($ch);
+
+if ($curlError || $httpCode !== 200 || !$response) {
+    http_response_code(502);
+    echo '<div style="font-family:sans-serif;padding:20px">';
+    echo '<h3 style="color:red">phpMyAdmin Auto-Login Failed</h3>';
+    if ($curlError) echo '<p>Connection error: ' . htmlspecialchars($curlError) . '</p>';
+    elseif ($httpCode === 404) echo '<p>Token expired or already used — please click the Auto-Login button again.</p>';
+    else echo '<p>Panel API returned HTTP ' . $httpCode . ' on port ' . $port . '.</p>';
+    echo '<p><a href="javascript:window.close()">Close this tab</a> and click the phpMyAdmin button again in NexaPanel.</p>';
+    echo '</div>';
+    exit;
+}
+
+$data = json_decode($response, true);
+if (!$data || empty($data['username'])) {
+    http_response_code(500);
+    echo '<p style="font-family:sans-serif;color:red">Credential decode error. Contact your administrator.</p>';
+    exit;
+}
+
+// Destroy any existing SignonSession first to avoid stale credential conflicts
+session_name('SignonSession');
+if (session_status() === PHP_SESSION_NONE) session_start();
+session_destroy();
+
+// Start fresh and write new credentials
+session_name('SignonSession');
+session_start();
+$_SESSION['PMA_single_signon_user']     = $data['username'];
+$_SESSION['PMA_single_signon_password'] = $data['password'];
+$_SESSION['PMA_single_signon_host']     = '127.0.0.1';
+$_SESSION['PMA_single_signon_port']     = '3306';
+session_write_close();
+
+$targetDb = !empty($db) ? $db : ($data['db'] ?? '');
+$redirect = '/phpmyadmin/' . ($targetDb ? '?db=' . rawurlencode($targetDb) : '');
+header('Location: ' . $redirect);
+exit;
+SIGNONPHP
+chown www-data:www-data /var/www/html/nexa-signon.php
+chmod 644 /var/www/html/nexa-signon.php
+ok "nexa-signon.php created"
 
 step "Setting file permissions"
 chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DIR" 2>/dev/null || true
